@@ -22,7 +22,9 @@ import type {
   Secret,
   SecretProvider,
   Signature,
+  TokenIssuer,
   TokenVerdict,
+  UserAuthProvider,
   Violation,
   SandboxStep,
   SandboxResult,
@@ -110,6 +112,10 @@ export interface FailClosedSecurityProviders {
   model: ModelProvider;
   authn: AuthTokenProvider;
   audit: AuditProvider;
+  /** Gateway-only user authentication (HS256). Absent => user auth fails closed. */
+  userAuth?: UserAuthProvider;
+  /** STS-only workload issuer. Absent => no workload token can be minted. */
+  tokenIssuer?: TokenIssuer;
 }
 
 export function failClosedProviders(logger: Logger): FailClosedSecurityProviders {

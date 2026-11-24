@@ -9,6 +9,7 @@ import type {
   RunRecord,
   RunState,
   TaskRecord,
+  UserRecord,
 } from "../../core/domain.js";
 import type {
   DocumentsRepository,
@@ -16,6 +17,7 @@ import type {
   ReportsRepository,
   RunsRepository,
   TasksRepository,
+  UsersRepository,
 } from "./contracts.js";
 
 type MongoDoc = {
@@ -23,7 +25,12 @@ type MongoDoc = {
   runId?: string;
   name?: string;
   scope?: { targets: string[] };
+  userId?: string;
+  tenantId?: string;
   config?: Record<string, unknown>;
+  email?: string;
+  passwordHash?: string;
+  scopes?: string[];
   state?: string;
   status?: string;
   version?: number;
@@ -66,6 +73,55 @@ function isoNow(): string {
   return new Date().toISOString();
 }
 
+class MongoUsersRepository implements UsersRepository {
+  private readonly collection: Collection<MongoDoc>;
+
+  constructor(db: Db) {
+    this.collection = db.collection<MongoDoc>("users");
+  }
+
+  async create(input: {
+    userId: string;
+    email: string;
+    passwordHash: string;
+    scopes: readonly string[];
+  }): Promise<UserRecord> {
+    const now = isoNow();
+    const doc: MongoDoc = {
+      _id: input.userId,
+      userId: input.userId,
+      email: input.email,
+      passwordHash: input.passwordHash,
+      scopes: [...input.scopes],
+      tsCreated: now,
+      tsUpdated: now,
+    };
+    await this.collection.insertOne(doc);
+    return this.toRecord(doc);
+  }
+
+  async getByEmail(email: string): Promise<UserRecord | null> {
+    const doc = await this.collection.findOne({ email: email.toLowerCase() });
+    return doc ? this.toRecord(doc) : null;
+  }
+
+  async get(userId: string): Promise<UserRecord | null> {
+    const doc = await this.collection.findOne({ _id: userId });
+    return doc ? this.toRecord(doc) : null;
+  }
+
+  private toRecord(doc: MongoDoc): UserRecord {
+    return {
+      userId: doc.userId as string,
+      email: (doc.email as string).toLowerCase(),
+      passwordHash: doc.passwordHash as string,
+      scopes: (doc.scopes ?? []) as readonly string[],
+      tsCreated: doc.tsCreated as string,
+      tsUpdated: doc.tsUpdated as string,
+    };
+  }
+}
+
 class MongoRunsRepository implements RunsRepository {
   private readonly collection: Collection<MongoDoc>;
 
@@ -81,6 +137,8 @@ class MongoRunsRepository implements RunsRepository {
       runId,
       name: input.name,
       scope: { targets: [...input.scope.targets] },
+      ...(input.userId !== undefined ? { userId: input.userId } : {}),
+      ...(input.tenantId !== undefined ? { tenantId: input.tenantId } : {}),
       config: input.config ?? {},
       state: "CREATED",
       timeline: [{ state: "CREATED", ts: now }],
@@ -105,10 +163,14 @@ class MongoRunsRepository implements RunsRepository {
   }
 
   private toRecord(doc: MongoDoc): RunRecord {
+    const userId = doc.userId as string | undefined;
+    const tenantId = doc.tenantId as string | undefined;
     return {
       runId: doc.runId as string,
       name: doc.name as string,
       scope: doc.scope as { targets: readonly string[] },
+      ...(userId !== undefined ? { userId } : {}),
+      ...(tenantId !== undefined ? { tenantId } : {}),
       config: (doc.config ?? {}) as Record<string, unknown>,
       state: doc.state as RunState,
       timeline: (doc.timeline as readonly { state: RunState; ts: string }[]) ?? [],
@@ -410,9 +472,11 @@ export function createMongoRepositories(db: Db): {
   findings: FindingsRepository;
   reports: ReportsRepository;
   documents: DocumentsRepository;
+  users: UsersRepository;
 } {
   return {
     runs: new MongoRunsRepository(db),
+    users: new MongoUsersRepository(db),
     tasks: new MongoTasksRepository(db),
     findings: new MongoFindingsRepository(db),
     reports: new MongoReportsRepository(db),
@@ -430,6 +494,7 @@ export async function ensureMongoSchema(db: Db): Promise<void> {
     db.collection("findings").createIndex({ hash: 1 }, { unique: true }),
     db.collection("reports").createIndex({ runId: 1, version: -1 }, { unique: true }),
     db.collection("documents").createIndex({ contentHash: 1 }, { unique: true }),
+    db.collection("users").createIndex({ email: 1 }, { unique: true }),
     db.collection("audit").createIndex({ ts: 1 }),
   ]);
 }

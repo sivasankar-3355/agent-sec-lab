@@ -2,22 +2,26 @@ import express, { type Application, type NextFunction, type Request, type Respon
 import type { Logger } from "pino";
 import { AppError } from "../core/errors.js";
 import { newId } from "../core/ids.js";
-import type { A2AClient } from "../a2a/client.js";
 import type { Repositories } from "../db/repositories/build.js";
+import type { RunTokenMinter } from "../security/protocols.js";
 import type { SecurityProviders } from "../security/container.js";
 import { createRequireAuth } from "./auth.js";
+import { createAuthRouter } from "./routers/auth.js";
 import { createHealthRouter, type HealthStores } from "./routers/health.js";
 import { createKnowledgeRouter } from "./routers/knowledge.js";
 import { createMeRouter } from "./routers/me.js";
 import { createReportsRouter } from "./routers/reports.js";
 import { createRunsRouter } from "./routers/runs.js";
+import type { OrchestratorLink } from "./routers/contract.js";
 
 export interface AppDeps {
   log: Logger;
   security: SecurityProviders;
   stores: HealthStores;
   repos: Repositories;
-  orchestrator?: A2AClient;
+  orchestrator?: OrchestratorLink;
+  /** STS client used to mint run-bound workload tokens (gateway side). */
+  sts?: RunTokenMinter;
 }
 
 export function createApp(deps: AppDeps): Application {
@@ -36,7 +40,20 @@ export function createApp(deps: AppDeps): Application {
 
   app.use(createHealthRouter(deps.stores));
 
-  const requireAuth = createRequireAuth(deps.security.authn);
+  // Open user authentication endpoints (registration + login). These mint
+  // HS256 user JWTs; they are the only unauthenticated API routes.
+  app.use(
+    "/api/v1",
+    createAuthRouter({
+      log: deps.log,
+      users: deps.repos.users,
+      ...(deps.security.userAuth !== undefined ? { userAuth: deps.security.userAuth } : {}),
+    }),
+  );
+
+  // Everything below requires a valid user JWT (HS256) when user auth is
+  // configured, otherwise it fails closed.
+  const requireAuth = createRequireAuth(deps.security.userAuth ?? deps.security.authn);
   const api = express.Router();
   api.use(requireAuth);
 
@@ -46,12 +63,14 @@ export function createApp(deps: AppDeps): Application {
     embedding: deps.security.embedding,
     repos: deps.repos,
     ...(deps.orchestrator !== undefined ? { orchestrator: deps.orchestrator } : {}),
+    ...(deps.sts !== undefined ? { sts: deps.sts } : {}),
   };
 
   api.use(createRunsRouter(routerDeps));
   api.use(createReportsRouter(routerDeps));
   api.use(createKnowledgeRouter(routerDeps));
   api.use(createMeRouter());
+
   app.use("/api/v1", api);
 
   app.use((_req: Request, res: Response) => {

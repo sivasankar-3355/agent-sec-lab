@@ -3,9 +3,9 @@ import { A2AError, AppError, NotFoundError } from "../../core/errors.js";
 import type { RunState, TaskRecord } from "../../core/domain.js";
 import type { Repositories } from "../../db/repositories/build.js";
 import { lockKeyFor, seenKeyFor, type Coordinator } from "../../db/coordinator.js";
-import type { AuditProvider } from "../../security/protocols.js";
+import type { AuditProvider, VerifiedContext } from "../../security/protocols.js";
 import { createAgentCard } from "../../a2a/agentCard.js";
-import type { A2AHandler } from "../../a2a/handler.js";
+import type { A2AHandler, CallContext } from "../../a2a/handler.js";
 import {
   A2A_PROTOCOL_VERSION,
   a2aStatusOf,
@@ -21,8 +21,9 @@ import {
 } from "../../a2a/schema.js";
 import type { AgentCard } from "../../a2a/agentCard.js";
 import { phaseFor, planRun } from "./workflows.js";
-import type { ChildTaskBroker } from "./broker.js";
+import { agentForKind, type ChildTaskBroker, type TokenExchanger } from "./broker.js";
 import { assertTransition } from "./state.js";
+import { a2aAudience } from "../../security/audience.js";
 
 export interface OrchestratorOptions {
   pollIntervalMs: number;
@@ -37,6 +38,7 @@ export interface OrchestratorDeps {
   repos: Repositories;
   coordinator: Coordinator;
   children: ChildTaskBroker;
+  exchange?: TokenExchanger;
   options?: Partial<OrchestratorOptions>;
 }
 
@@ -47,14 +49,23 @@ const DEFAULT_OPTIONS: OrchestratorOptions = {
   seenTtlMs: 24 * 60 * 60 * 1000,
 };
 
+function assertRunBound(bound: VerifiedContext | undefined, runId: string, method: string): void {
+  if (bound === undefined || bound.runId === "") return;
+  if (runId !== bound.runId) {
+    throw new AppError("forbidden", `${method}: run '${runId}' outside authorized run '${bound.runId}'`, 403);
+  }
+}
+
 export class OrchestratorHandler implements A2AHandler {
   private readonly log: Logger;
   private readonly audit: AuditProvider;
   private readonly repos: Repositories;
   private readonly coordinator: Coordinator;
   private readonly children: ChildTaskBroker;
+  private readonly exchange: TokenExchanger | undefined;
   private readonly options: OrchestratorOptions;
   private readonly drives = new Map<string, Promise<void>>();
+  private readonly runTokens = new Map<string, string>();
 
   constructor(deps: OrchestratorDeps) {
     this.log = deps.log;
@@ -62,6 +73,7 @@ export class OrchestratorHandler implements A2AHandler {
     this.repos = deps.repos;
     this.coordinator = deps.coordinator;
     this.children = deps.children;
+    this.exchange = deps.exchange;
     this.options = { ...DEFAULT_OPTIONS, ...(deps.options ?? {}) };
   }
 
@@ -69,7 +81,7 @@ export class OrchestratorHandler implements A2AHandler {
     return createAgentCard("orchestrator");
   }
 
-  async initialize(): Promise<InitializeResult> {
+  async initialize(_params: { agentId?: string }): Promise<InitializeResult> {
     return {
       protocolVersion: A2A_PROTOCOL_VERSION,
       agentId: "orchestrator",
@@ -77,17 +89,32 @@ export class OrchestratorHandler implements A2AHandler {
     };
   }
 
-  async messageSend(message: A2AMessage): Promise<{ message: A2AMessage }> {
+  async messageSend(message: A2AMessage, ctx?: CallContext): Promise<{ message: A2AMessage }> {
+    assertRunBound(ctx?.verified, message.runId, "message/send");
     const run = await this.repos.runs.get(message.runId);
     if (!run) throw new NotFoundError("run not found");
     return { message };
   }
 
-  async taskSend(task: TaskInit): Promise<{ task: A2ATask }> {
+  async taskSend(task: TaskInit, ctx?: CallContext): Promise<{ task: A2ATask }> {
     if (task.kind !== "run.start") {
       throw new AppError("unsupported_task_kind", `orchestrator only accepts run.start tasks, got '${task.kind}'`, 422);
     }
     validateTaskInput(task.kind, task.input);
+
+    const bound = ctx?.verified;
+    if (bound !== undefined && bound.runId !== "") {
+      assertRunBound(bound, task.runId, "tasks/send");
+      if (!bound.permittedActions.includes("run.start")) {
+        throw new AppError("forbidden", "run.start is not permitted by the presented run token", 403);
+      }
+      if (bound.nonce.length > 0) {
+        const fresh = await this.coordinator.ensureSeen(`jti:${bound.nonce}`, 24 * 60 * 60 * 1000);
+        if (!fresh) {
+          throw new AppError("forbidden", "run token already used", 403);
+        }
+      }
+    }
 
     const existing = await this.repos.tasks.get(task.taskId);
     if (existing) {
@@ -105,7 +132,7 @@ export class OrchestratorHandler implements A2AHandler {
     const run = await this.repos.runs.get(task.runId);
     if (!run) throw new NotFoundError("run not found");
 
-    const seen = await this.coordinator.ensureSeen(`a2a:start:${task.taskId}`);
+    const seen = await this.coordinator.ensureSeen(`a2a:start:${task.taskId}`, this.options.seenTtlMs);
     if (!seen) {
       const recorded = await this.repos.tasks.get(task.taskId);
       if (recorded) {
@@ -132,21 +159,27 @@ export class OrchestratorHandler implements A2AHandler {
       attempts: 1,
     });
 
+    if (ctx?.token !== undefined && bound !== undefined && bound.runId !== "") {
+      this.runTokens.set(task.runId, ctx.token);
+    }
+
     const drive = this.driveRun(task.runId, task.taskId);
     this.drives.set(task.runId, drive);
     const recorded = await this.repos.tasks.get(task.taskId);
     return { task: this.toA2ATask(recorded!) };
   }
 
-  async taskGet(id: string): Promise<{ task: A2ATask }> {
+  async taskGet(id: string, ctx?: CallContext): Promise<{ task: A2ATask }> {
     const record = await this.repos.tasks.get(id);
     if (!record) throw new NotFoundError("task not found");
+    assertRunBound(ctx?.verified, record.runId, "tasks/get");
     return { task: this.toA2ATask(record) };
   }
 
-  async taskCancel(id: string): Promise<{ task: A2ATask }> {
+  async taskCancel(id: string, ctx?: CallContext): Promise<{ task: A2ATask }> {
     const record = await this.repos.tasks.get(id);
     if (!record) throw new NotFoundError("task not found");
+    assertRunBound(ctx?.verified, record.runId, "tasks/cancel");
     if (record.status === "SUCCEEDED" || record.status === "FAILED" || record.status === "CANCELLED") {
       return { task: this.toA2ATask(record) };
     }
@@ -212,9 +245,13 @@ export class OrchestratorHandler implements A2AHandler {
           status: "PENDING",
           attempts: 1,
         });
-        await this.coordinator.ensureSeen(seenKeyFor(runId, child.taskId));
+        await this.coordinator.ensureSeen(seenKeyFor(runId, child.taskId), this.options.seenTtlMs);
 
-        const submitted = await this.children.submit(child);
+        const childToken =
+          this.exchange !== undefined && this.runTokens.has(runId)
+            ? await this.childToken(runId, child.kind)
+            : undefined;
+        const submitted = await this.children.submit(child, childToken);
         if (submitted.status === "failed" || submitted.status === "canceled") {
           await this.repos.tasks.setStatus(child.taskId, "FAILED", {
             ...(submitted.error !== undefined ? { error: submitted.error } : {}),
@@ -275,7 +312,19 @@ export class OrchestratorHandler implements A2AHandler {
     } finally {
       await this.coordinator.releaseLock(lockKeyFor(runId));
       this.drives.delete(runId);
+      this.runTokens.delete(runId);
     }
+  }
+
+  private async childToken(runId: string, kind: string): Promise<string> {
+    const runToken = this.runTokens.get(runId);
+    if (runToken === undefined || this.exchange === undefined) {
+      throw new A2AError(`no run token available to delegate children for run '${runId}'`, 503);
+    }
+    const agent = agentForKind(kind);
+    const audience = a2aAudience(agent);
+    const actions = [kind];
+    return this.exchange.exchange(runToken, { audience, actions });
   }
 
   private async pollChild(taskId: string): Promise<A2ATask> {

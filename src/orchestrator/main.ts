@@ -1,16 +1,15 @@
 import express from "express";
 import { loadConfig } from "../core/config.js";
 import { createLogger } from "../core/logger.js";
-import { createContainer } from "../security/container.js";
+import { buildSecurityProviders } from "../security/build.js";
 import { connectStores, disconnectStores } from "../api/deps.js";
 import { createRepositories } from "../db/repositories/build.js";
 import { createRedisCoordinator } from "../db/coordinator.js";
 import { createA2ARouter } from "../a2a/server.js";
-import { A2AClient } from "../a2a/client.js";
+import { STSClient } from "../a2a/sts.js";
 import { AgentClientsBroker } from "../agents/orchestrator/broker.js";
 import { OrchestratorHandler } from "../agents/orchestrator/handler.js";
-
-const A2A_SCOPES = ["a2a:tasks/read", "a2a:tasks/write", "a2a:message/send"] as const;
+import { A2A_SCOPES, INTERNAL_EXCHANGE_SCOPE, a2aAudience } from "../security/audience.js";
 
 async function start(): Promise<void> {
   const config = loadConfig();
@@ -18,31 +17,45 @@ async function start(): Promise<void> {
 
   const stores = await connectStores(config, log);
   const repos = await createRepositories(stores.mongo!, stores.qdrant!);
-  const container = createContainer(config, log);
+  const security = buildSecurityProviders(config, log);
   const coordinator = createRedisCoordinator(stores.redis!);
 
-  let agentToken: string | undefined;
+  // The orchestrator NEVER holds the signing key and NEVER mints tokens.
+  // Its workload token must come from the dedicated STS: either via the
+  // bootstrap-secret token-issue endpoint, or (EKS) workload identity.
+  let workloadToken: string | undefined;
   try {
-    agentToken = await container.security.authn.createToken("orchestrator", A2A_SCOPES);
+    if (config.STS_URL.length > 0) {
+      let bootstrap: string;
+      try {
+        const secret = await security.secrets.get("WORKLOAD_BOOTSTRAP");
+        bootstrap = secret.value;
+      } catch (err) {
+        throw new Error(`no WORKLOAD_BOOTSTRAP secret available: ${err instanceof Error ? err.message : "unknown"}`);
+      }
+      const stsBootstrap = new STSClient(config.STS_URL, { bootstrapSecret: bootstrap });
+      workloadToken = await stsBootstrap.issue("orchestrator", [INTERNAL_EXCHANGE_SCOPE, ...A2A_SCOPES]);
+      log.info("orchestrator workload token issued by STS");
+    }
   } catch (err) {
-    log.warn({ err }, "agent token unavailable; A2A outbound links fail closed");
+    log.warn({ err }, "orchestrator workload token unavailable; child delegation fails closed");
   }
 
-  const childClients = (base: string | undefined): A2AClient | undefined => {
-    if (!base || agentToken === undefined) return undefined;
-    return new A2AClient(base, { token: agentToken });
-  };
+  const exchange = config.STS_URL.length > 0 && workloadToken !== undefined
+    ? new STSClient(config.STS_URL, { workloadToken })
+    : undefined;
 
   const handler = new OrchestratorHandler({
     log,
-    audit: container.security.audit,
+    audit: security.audit,
     repos,
     coordinator,
     children: new AgentClientsBroker({
-      ...(childClients(config.RECON_A2A_URL) ? { recon: childClients(config.RECON_A2A_URL)! } : {}),
-      ...(childClients(config.KNOWLEDGE_A2A_URL) ? { knowledge: childClients(config.KNOWLEDGE_A2A_URL)! } : {}),
-      ...(childClients(config.REPORT_A2A_URL) ? { report: childClients(config.REPORT_A2A_URL)! } : {}),
+      ...(config.RECON_A2A_URL.length > 0 ? { recon: { base: config.RECON_A2A_URL } } : {}),
+      ...(config.KNOWLEDGE_A2A_URL.length > 0 ? { knowledge: { base: config.KNOWLEDGE_A2A_URL } } : {}),
+      ...(config.REPORT_A2A_URL.length > 0 ? { report: { base: config.REPORT_A2A_URL } } : {}),
     }),
+    ...(exchange !== undefined ? { exchange } : {}),
   });
 
   const app = express();
@@ -51,9 +64,11 @@ async function start(): Promise<void> {
   app.use(
     createA2ARouter(handler, {
       log,
-      authn: container.security.authn,
-      authz: container.security.authz,
-      audit: container.security.audit,
+      authn: security.authn,
+      authz: security.authz,
+      audit: security.audit,
+      agent: "orchestrator",
+      audience: a2aAudience("orchestrator"),
     }),
   );
 

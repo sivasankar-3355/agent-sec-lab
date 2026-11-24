@@ -5,7 +5,6 @@ import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../../src/api/app.js";
 import { createA2ARouter } from "../../src/a2a/server.js";
-import { A2AClient } from "../../src/a2a/client.js";
 import { OrchestratorHandler } from "../../src/agents/orchestrator/handler.js";
 import { createLogger } from "../../src/core/logger.js";
 import { newId } from "../../src/core/ids.js";
@@ -108,13 +107,12 @@ describe("orchestrator A2A server", () => {
 
 describe("orchestrator e2e skeleton", () => {
   it("drives a run to completion over HTTP A2A", async () => {
-    const client = new A2AClient(baseUrl, { token: "test-token" });
     const api = createApp({
       log,
       security,
       stores: {},
       repos: sharedRepos,
-      orchestrator: client,
+      orchestrator: { base: baseUrl, token: "test-token" },
     });
 
     const res = await request(api)

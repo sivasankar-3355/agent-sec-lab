@@ -1,10 +1,10 @@
 import type { Logger } from "pino";
 import { AppError, NotFoundError } from "../core/errors.js";
 import type { Repositories } from "../db/repositories/build.js";
-import type { AuditProvider } from "../security/protocols.js";
+import type { AuditProvider, VerifiedContext } from "../security/protocols.js";
 import type { SecurityProviders } from "../security/container.js";
 import { createAgentCard } from "../a2a/agentCard.js";
-import type { A2AHandler } from "../a2a/handler.js";
+import type { A2AHandler, CallContext } from "../a2a/handler.js";
 import {
   A2A_PROTOCOL_VERSION,
   artifactFor,
@@ -31,6 +31,7 @@ export interface WorkerExecuteInput {
   runId: string;
   kind: TaskKind;
   input: Record<string, unknown>;
+  authz?: VerifiedContext;
 }
 
 export interface WorkerExecutor {
@@ -42,6 +43,31 @@ interface MemoryTask {
   status: A2AStatus;
   artifact?: { artifactId: string; text: string };
   error?: string;
+}
+
+function assertRunBound(
+  bound: VerifiedContext | undefined,
+  task: { runId: string; kind: string; input?: Record<string, unknown> },
+  method: string,
+): void {
+  if (bound === undefined || bound.runId === "") return;
+  if (task.runId !== bound.runId) {
+    throw new AppError("forbidden", `${method}: run '${task.runId}' outside authorized run '${bound.runId}'`, 403);
+  }
+  if (!bound.permittedActions.includes(task.kind)) {
+    throw new AppError("forbidden", `${method}: kind '${task.kind}' not permitted for this run`, 403);
+  }
+  if (
+    task.kind === "recon.run" &&
+    typeof task.input?.target === "string" &&
+    !bound.scopeTargets.includes(task.input.target)
+  ) {
+    throw new AppError(
+      "forbidden",
+      `${method}: target '${task.input.target}' is outside the approved scope [${bound.scopeTargets.join(", ")}]`,
+      403,
+    );
+  }
 }
 
 export class BaseWorkerHandler implements A2AHandler {
@@ -63,7 +89,7 @@ export class BaseWorkerHandler implements A2AHandler {
     return createAgentCard(this.agent);
   }
 
-  async initialize(): Promise<InitializeResult> {
+  async initialize(_params: { agentId?: string }): Promise<InitializeResult> {
     return {
       protocolVersion: A2A_PROTOCOL_VERSION,
       agentId: this.agent,
@@ -71,11 +97,15 @@ export class BaseWorkerHandler implements A2AHandler {
     };
   }
 
-  async messageSend(message: A2AMessage): Promise<{ message: A2AMessage }> {
+  async messageSend(message: A2AMessage, ctx?: CallContext): Promise<{ message: A2AMessage }> {
+    const bound = ctx?.verified;
+    if (bound !== undefined && bound.runId !== "" && message.runId !== bound.runId) {
+      throw new AppError("forbidden", `message run '${message.runId}' outside authorized run '${bound.runId}'`, 403);
+    }
     return { message };
   }
 
-  async taskSend(task: TaskInit): Promise<{ task: A2ATask }> {
+  async taskSend(task: TaskInit, ctx?: CallContext): Promise<{ task: A2ATask }> {
     if (!this.acceptedKinds.includes(task.kind)) {
       throw new AppError(
         "unsupported_task_kind",
@@ -84,25 +114,28 @@ export class BaseWorkerHandler implements A2AHandler {
       );
     }
     validateTaskInput(task.kind, task.input);
+    assertRunBound(ctx?.verified, task, "tasks/send");
 
     const existing = this.tasks.get(task.taskId);
     if (existing) return { task: this.toA2A(existing) };
 
     const record: MemoryTask = { init: task, status: "submitted" };
     this.tasks.set(task.taskId, record);
-    this.running.set(task.taskId, this.run(task));
+    this.running.set(task.taskId, this.run(task, ctx?.verified));
     return { task: this.toA2A(record) };
   }
 
-  async taskGet(id: string): Promise<{ task: A2ATask }> {
+  async taskGet(id: string, ctx?: CallContext): Promise<{ task: A2ATask }> {
     const record = this.tasks.get(id);
     if (!record) throw new NotFoundError("task not found");
+    assertRunBound(ctx?.verified, record.init, "tasks/get");
     return { task: this.toA2A(record) };
   }
 
-  async taskCancel(id: string): Promise<{ task: A2ATask }> {
+  async taskCancel(id: string, ctx?: CallContext): Promise<{ task: A2ATask }> {
     const record = this.tasks.get(id);
     if (!record) throw new NotFoundError("task not found");
+    assertRunBound(ctx?.verified, record.init, "tasks/cancel");
     if (record.status === "completed" || record.status === "failed" || record.status === "canceled") {
       return { task: this.toA2A(record) };
     }
@@ -123,7 +156,7 @@ export class BaseWorkerHandler implements A2AHandler {
     await Promise.all([...this.running.values()]);
   }
 
-  private async run(task: TaskInit): Promise<void> {
+  private async run(task: TaskInit, authz?: VerifiedContext): Promise<void> {
     this.tasks.get(task.taskId)!.status = "working";
     void this.ctx.audit.emit({
       type: "task.started",
@@ -139,6 +172,7 @@ export class BaseWorkerHandler implements A2AHandler {
         runId: task.runId,
         kind: task.kind,
         input: task.input,
+        ...(authz !== undefined ? { authz } : {}),
       });
       const record = this.tasks.get(task.taskId);
       if (!record || record.status === "canceled") return;

@@ -3,16 +3,27 @@ import type { Response } from "express";
 import { z } from "zod";
 import { ValidationError, AuthorizationDeniedError } from "../../core/errors.js";
 import type { Repositories } from "../../db/repositories/build.js";
-import type { AuthzResource, AuthorizationProvider, EmbeddingProvider } from "../../security/protocols.js";
-import type { A2AClient } from "../../a2a/client.js";
+import type {
+  AuthzResource,
+  AuthorizationProvider,
+  EmbeddingProvider,
+  RunTokenMinter,
+} from "../../security/protocols.js";
 import { readPrincipal } from "../auth.js";
+
+export interface OrchestratorLink {
+  base: string;
+  token?: string;
+}
 
 export interface RouterDeps {
   log: Logger;
   authz: AuthorizationProvider;
   embedding: EmbeddingProvider;
   repos: Repositories;
-  orchestrator?: A2AClient;
+  orchestrator?: OrchestratorLink;
+  /** Mints run-bound workload tokens by calling the STS (gateway side only). */
+  sts?: RunTokenMinter;
 }
 
 export function parseBody<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, value: unknown): T {
@@ -32,6 +43,10 @@ export function parseId(raw: string, label: string): string {
   } catch {
     throw new ValidationError(`invalid ${label} id`);
   }
+}
+
+export function readUserId(res: Response): string {
+  return readPrincipal(res)?.userId ?? "";
 }
 
 export async function requireAuthorized(

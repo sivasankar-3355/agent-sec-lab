@@ -11,13 +11,16 @@
     "build": "pnpm typecheck && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "dev": "tsx watch src/api/main.ts",
+    "dev:sts": "tsx watch src/sts/main.ts",
     "start": "node dist/api/main.js",
+    "start:sts": "node dist/sts/main.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint ."
   },
   "dependencies": {
     "@qdrant/js-client-rest": "^1.13.0",
+    "bcryptjs": "^3.0.3",
     "express": "^5.1.0",
     "ioredis": "^5.6.0",
     "mongodb": "^6.17.0",

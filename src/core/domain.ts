@@ -30,6 +30,8 @@ export interface Scope {
 export interface RunCreateInput {
   name: string;
   scope: Scope;
+  userId?: string;
+  tenantId?: string;
   config?: Record<string, unknown>;
 }
 
@@ -37,9 +39,20 @@ export interface RunRecord {
   runId: string;
   name: string;
   scope: Scope;
+  userId?: string;
+  tenantId?: string;
   config: Record<string, unknown>;
   state: RunState;
   timeline: readonly TimelineEntry[];
+  tsCreated: string;
+  tsUpdated: string;
+}
+
+export interface UserRecord {
+  userId: string;
+  email: string;
+  passwordHash: string;
+  scopes: readonly string[];
   tsCreated: string;
   tsUpdated: string;
 }

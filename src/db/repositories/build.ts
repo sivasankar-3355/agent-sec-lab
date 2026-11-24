@@ -3,10 +3,11 @@ import type { QdrantStore } from "../qdrant.js";
 import { createMongoRepositories, ensureMongoSchema } from "./mongo.js";
 import { QdrantKnowledgeVectorStore } from "../knowledge.js";
 import type { KnowledgeVectorStore } from "../knowledge-contract.js";
-import type { DocumentsRepository, FindingsRepository, ReportsRepository, RunsRepository, TasksRepository } from "./contracts.js";
+import type { DocumentsRepository, FindingsRepository, ReportsRepository, RunsRepository, TasksRepository, UsersRepository } from "./contracts.js";
 
 export interface Repositories {
   runs: RunsRepository;
+  users: UsersRepository;
   tasks: TasksRepository;
   findings: FindingsRepository;
   reports: ReportsRepository;
@@ -21,6 +22,7 @@ export async function createRepositories(mongo: MongoStore, qdrant: QdrantStore)
   const base = createMongoRepositories(db);
   return {
     runs: base.runs,
+    users: base.users,
     tasks: base.tasks,
     findings: base.findings,
     reports: base.reports,

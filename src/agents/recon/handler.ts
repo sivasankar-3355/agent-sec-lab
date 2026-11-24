@@ -1,4 +1,4 @@
-import { EgressDeniedError, PolicyViolationError } from "../../core/errors.js";
+import { AppError, EgressDeniedError, PolicyViolationError } from "../../core/errors.js";
 import { newId, stableHash } from "../../core/ids.js";
 import type { WorkerContext, WorkerExecuteInput, WorkerExecutor } from "../base.js";
 
@@ -7,6 +7,20 @@ export const reconAcceptedKinds: readonly ["recon.run"] = ["recon.run"];
 export class ReconExecutor implements WorkerExecutor {
   async execute(ctx: WorkerContext, task: WorkerExecuteInput): Promise<Record<string, unknown>> {
     const target = String(task.input.target);
+
+    if (task.authz !== undefined && task.authz.runId !== "") {
+      if (task.runId !== task.authz.runId) {
+        throw new AppError("forbidden", `recon run '${task.runId}' outside authorized run '${task.authz.runId}'`, 403);
+      }
+      if (!task.authz.scopeTargets.includes(target)) {
+        throw new AppError(
+          "forbidden",
+          `recon target '${target}' is outside the approved scope [${task.authz.scopeTargets.join(", ")}]`,
+          403,
+        );
+      }
+    }
+
     const rulesRef = typeof task.input.rulesRef === "string" && task.input.rulesRef.length > 0 ? task.input.rulesRef : undefined;
 
     const violations = await ctx.security.policy.evaluate(target, "recon.snapshot", rulesRef === undefined ? [] : [rulesRef]);

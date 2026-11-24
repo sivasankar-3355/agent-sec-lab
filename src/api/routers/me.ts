@@ -6,7 +6,11 @@ export function createMeRouter(): Router {
 
   router.get("/me", (_req, res) => {
     const principal = readPrincipal(res);
-    res.status(200).json({ principal: principal?.principal ?? null, scopes: principal?.scopes ?? [] });
+    res.status(200).json({
+      principal: principal?.principal ?? null,
+      scopes: principal?.scopes ?? [],
+      userId: principal?.userId ?? null,
+    });
   });
 
   return router;

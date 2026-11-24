@@ -9,6 +9,7 @@ import type {
   RunState,
   TaskRecord,
   TaskStatus,
+  UserRecord,
 } from "../../src/core/domain.js";
 import type {
   DocumentsRepository,
@@ -16,6 +17,7 @@ import type {
   ReportsRepository,
   RunsRepository,
   TasksRepository,
+  UsersRepository,
 } from "../../src/db/repositories/contracts.js";
 import type { KnowledgeVectorStore, VectorHit, UpsertChunksInput } from "../../src/db/knowledge-contract.js";
 import type { Coordinator } from "../../src/db/coordinator.js";
@@ -33,10 +35,71 @@ import type {
   NetworkPolicyProvider,
   PolicyProvider,
   SandboxProvider,
+  SecretProvider,
   Signature,
   TokenVerdict,
 } from "../../src/security/protocols.js";
 import { failClosedProviders, type FailClosedSecurityProviders } from "../../src/security/defaults.js";
+import { JwtTokenService, JwtVerifier } from "../../src/security/jwt-issuer.js";
+import { UserAuthService } from "../../src/security/user-jwt.js";
+import { USER_SCOPES } from "../../src/security/audience.js";
+
+import { generateKeyPairSync } from "node:crypto";
+
+export interface TestIdentity {
+  /** Workload issuer (STS-side, RS256 private key). */
+  issuer: JwtTokenService;
+  /** Workload verifier (agents, public key only). */
+  verifier: JwtVerifier;
+  /** User authentication (gateway-side, HS256 dedicated secret). */
+  userAuth: UserAuthService;
+  /** RSA private key used by the test issuer (for crafting edge-case tokens). */
+  privateKey: string;
+  /** RSA public key that verifies the test issuer's tokens. */
+  publicKey: string;
+  /** HS256 user JWT for `user:alice`. */
+  userToken(): Promise<string>;
+  /** RS256 workload identity token. */
+  workloadToken(workload: string, scopes: readonly string[]): Promise<string>;
+}
+
+export function makeTestIdentity(): TestIdentity {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  const workloadOptions = {
+    issuer: "agent-sec-lab-test",
+    keyId: "test-key",
+    signingKeyPem: privateKey,
+    publicKeys: new Map([[ "test-key", publicKey ]]),
+    workloadTtlSec: 300,
+    runTtlSec: 1800,
+    childTtlSec: 600,
+  };
+  const issuer = new JwtTokenService(workloadOptions);
+  const verifier = new JwtVerifier(workloadOptions);
+  const userAuth = new UserAuthService({
+    secret: "test-user-secret-0123456789abcdef0123456789abcdef",
+    issuer: "agent-sec-lab-user",
+    audience: "api-gateway",
+    ttlSec: 1800,
+  });
+  return {
+    issuer,
+    verifier,
+    userAuth,
+    privateKey,
+    publicKey,
+    async userToken() {
+      return userAuth.mintUserToken("user:alice", [...USER_SCOPES]);
+    },
+    async workloadToken(workload, scopes) {
+      return issuer.mintWorkloadToken(workload, scopes);
+    },
+  };
+}
 
 export function isoNow(): string {
   return new Date().toISOString();
@@ -124,6 +187,18 @@ export class TestCryptoProvider implements CryptoProvider {
   }
 }
 
+export class TestSecretProvider implements SecretProvider {
+  constructor(private readonly secrets: Record<string, string>) {}
+
+  async get(name: string): Promise<{ name: string; value: string }> {
+    const value = this.secrets[name];
+    if (value === undefined) {
+      throw new Error(`secret '${name}' not found in test`);
+    }
+    return { name, value };
+  }
+}
+
 export class TestEmbeddingProvider implements EmbeddingProvider {
   async embed(texts: readonly string[]): Promise<number[][]> {
     return texts.map((t) => hashVector(t));
@@ -141,6 +216,41 @@ export function testSecurity(log: Logger, overrides?: Partial<FailClosedSecurity
   };
 }
 
+class FakeUsersRepository implements UsersRepository {
+  readonly users: UserRecord[] = [];
+
+  async create(input: {
+    userId: string;
+    email: string;
+    passwordHash: string;
+    scopes: readonly string[];
+  }): Promise<UserRecord> {
+    const now = isoNow();
+    const record: UserRecord = {
+      userId: input.userId,
+      email: input.email.toLowerCase(),
+      passwordHash: input.passwordHash,
+      scopes: [...input.scopes],
+      tsCreated: now,
+      tsUpdated: now,
+    };
+    this.users.push(record);
+    return record;
+  }
+
+  async getByEmail(email: string): Promise<UserRecord | null> {
+    return this.users.find((u) => u.email === email.toLowerCase()) ?? null;
+  }
+
+  async get(userId: string): Promise<UserRecord | null> {
+    return this.users.find((u) => u.userId === userId) ?? null;
+  }
+
+  seed(record: UserRecord): void {
+    this.users.push(record);
+  }
+}
+
 class FakeRunsRepository implements RunsRepository {
   private readonly records = new Map<string, RunRecord>();
   readonly created: RunRecord[] = [];
@@ -151,6 +261,8 @@ class FakeRunsRepository implements RunsRepository {
       runId: newId(),
       name: input.name,
       scope: { targets: [...input.scope.targets] },
+      ...(input.userId !== undefined ? { userId: input.userId } : {}),
+      ...(input.tenantId !== undefined ? { tenantId: input.tenantId } : {}),
       config: input.config ?? {},
       state: "CREATED",
       timeline: [{ state: "CREATED", ts: now }],
@@ -424,7 +536,7 @@ export class FakeChildBroker implements ChildTaskBroker {
     for (const [kind, outcome] of Object.entries(outcomes)) this.byKind.set(kind, outcome);
   }
 
-  async submit(task: TaskInit): Promise<A2ATask> {
+  async submit(task: TaskInit, _token?: string): Promise<A2ATask> {
     this.submitted.push(task);
     const outcome = this.byKind.get(task.kind);
     const base: A2ATask = {
@@ -509,6 +621,7 @@ export class FakeChildBroker implements ChildTaskBroker {
 
 export class FakeRepositories implements Repositories {
   readonly runs = new FakeRunsRepository();
+  readonly users = new FakeUsersRepository();
   readonly tasks = new FakeTasksRepository();
   readonly findings = new FakeFindingsRepository();
   readonly reports = new FakeReportsRepository();

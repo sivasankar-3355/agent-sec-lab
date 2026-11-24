@@ -4,8 +4,10 @@ import { NotFoundError } from "../../core/errors.js";
 import { newId } from "../../core/ids.js";
 import type { FindingSeverity } from "../../core/domain.js";
 import type { TaskInit } from "../../a2a/schema.js";
+import { A2AClient } from "../../a2a/client.js";
+import { A2A_SCOPES, RUN_ACTIONS } from "../../security/audience.js";
 import type { RouterDeps } from "./contract.js";
-import { parseBody, parseId, requireAuthorized } from "./contract.js";
+import { parseBody, parseId, readUserId, requireAuthorized } from "./contract.js";
 
 const runCreateSchema = z
   .object({
@@ -21,13 +23,38 @@ export function createRunsRouter(deps: RouterDeps): Router {
   router.post("/runs", async (req, res) => {
     await requireAuthorized(deps.authz, "runs:create", res);
     const body = parseBody(runCreateSchema, req.body);
+    const userId = readUserId(res);
     const run = await deps.repos.runs.create({
       name: body.name,
       scope: { targets: [...body.scope.targets] },
+      ...(userId.length > 0 ? { userId } : {}),
       ...(body.config ? { config: body.config } : {}),
     });
 
     if (deps.orchestrator !== undefined) {
+      let dispatchToken = deps.orchestrator.token;
+      // The gateway never signs workload tokens: the run token is minted by
+      // the STS (via deps.sts), which validates the trusted run record.
+      if (dispatchToken === undefined && deps.sts !== undefined && userId.length > 0) {
+        try {
+          dispatchToken = await deps.sts.mintRun({
+            userId,
+            runId: run.runId,
+            targets: [...body.scope.targets],
+            actions: [...RUN_ACTIONS],
+            correlationId: newId(),
+            scopes: [...A2A_SCOPES],
+          });
+        } catch (err) {
+          deps.log.warn({ err, runId: run.runId }, "STS refused to mint a run token; dispatch skipped");
+        }
+      }
+      if (dispatchToken === undefined) {
+        deps.log.warn({ runId: run.runId }, "no dispatch token available; run.start not dispatched");
+        deps.log.info({ runId: run.runId }, "run created");
+        res.status(202).json({ run_id: run.runId, state: run.state });
+        return;
+      }
       const task: TaskInit = {
         taskId: newId(),
         runId: run.runId,
@@ -38,7 +65,8 @@ export function createRunsRouter(deps: RouterDeps): Router {
         },
       };
       try {
-        await deps.orchestrator.taskSend(task);
+        const client = new A2AClient(deps.orchestrator.base, { token: dispatchToken });
+        await client.taskSend(task);
         deps.log.info({ runId: run.runId }, "run.start dispatched to orchestrator");
       } catch (err) {
         deps.log.warn({ err, runId: run.runId }, "run.start dispatch failed; run remains CREATED");

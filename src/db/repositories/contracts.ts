@@ -10,7 +10,14 @@ import type {
   RunState,
   TaskRecord,
   TaskStatus,
+  UserRecord,
 } from "../../core/domain.js";
+
+export interface UsersRepository {
+  create(input: { userId: string; email: string; passwordHash: string; scopes: readonly string[] }): Promise<UserRecord>;
+  getByEmail(email: string): Promise<UserRecord | null>;
+  get(userId: string): Promise<UserRecord | null>;
+}
 
 export interface RunsRepository {
   create(input: RunCreateInput): Promise<RunRecord>;

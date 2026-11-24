@@ -5,6 +5,7 @@ import type { AuthTokenProvider } from "../security/protocols.js";
 export interface PrincipalContext {
   principal: string;
   scopes: readonly string[];
+  userId?: string;
 }
 
 export function readPrincipal(res: Response): PrincipalContext | undefined {
@@ -21,7 +22,13 @@ export function createRequireAuth(authn: AuthTokenProvider) {
       throw new UnauthenticatedError(verdict.reason ?? "missing or invalid token");
     }
 
-    res.locals.principal = { principal: verdict.principal, scopes: verdict.scopes ?? [] };
+    res.locals.principal = {
+      principal: verdict.principal,
+      scopes: verdict.scopes ?? [],
+      ...(verdict.context !== undefined
+        ? { userId: verdict.context.userId !== "" ? verdict.context.userId : verdict.principal }
+        : { userId: verdict.principal }),
+    };
     next();
   };
 }

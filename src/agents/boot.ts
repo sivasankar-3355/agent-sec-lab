@@ -1,12 +1,13 @@
 import express from "express";
 import { loadConfig } from "../core/config.js";
 import { createLogger } from "../core/logger.js";
-import { createContainer } from "../security/container.js";
+import { buildSecurityProviders } from "../security/build.js";
 import { connectStores, disconnectStores } from "../api/deps.js";
 import { createRepositories } from "../db/repositories/build.js";
 import { createA2ARouter } from "../a2a/server.js";
 import { BaseWorkerHandler, type WorkerExecutor } from "./base.js";
 import type { AgentKind, TaskKind } from "../a2a/schema.js";
+import { a2aAudience } from "../security/audience.js";
 
 export async function bootWorker(
   agent: AgentKind,
@@ -18,16 +19,16 @@ export async function bootWorker(
 
   const stores = await connectStores(config, log);
   const repos = await createRepositories(stores.mongo!, stores.qdrant!);
-  const container = createContainer(config, log);
+  const security = buildSecurityProviders(config, log);
 
   const handler = new BaseWorkerHandler(
     agent,
     executor,
     {
       log,
-      audit: container.security.audit,
+      audit: security.audit,
       repos,
-      security: container.security,
+      security,
     },
     acceptedKinds,
   );
@@ -38,9 +39,11 @@ export async function bootWorker(
   app.use(
     createA2ARouter(handler, {
       log,
-      authn: container.security.authn,
-      authz: container.security.authz,
-      audit: container.security.audit,
+      authn: security.authn,
+      authz: security.authz,
+      audit: security.audit,
+      agent,
+      audience: a2aAudience(agent),
     }),
   );
 
