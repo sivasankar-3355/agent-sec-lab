@@ -1,0 +1,42 @@
+{
+  "name": "agent-sec-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@12.21.0",
+  "scripts": {
+    "build": "pnpm typecheck && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx watch src/api/main.ts",
+    "start": "node dist/api/main.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.13.0",
+    "express": "^5.1.0",
+    "ioredis": "^5.6.0",
+    "mongodb": "^6.17.0",
+    "pino": "^9.8.0",
+    "uuid": "^11.1.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.30.0",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.0",
+    "@types/supertest": "^6.0.3",
+    "eslint": "^9.30.0",
+    "globals": "^16.3.0",
+    "pino-pretty": "^13.1.0",
+    "supertest": "^7.1.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.40.0",
+    "vitest": "^3.2.0"
+  }
+}
