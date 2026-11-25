@@ -10,6 +10,7 @@ import type {
   EmbeddingProvider,
   RunTokenMinter,
 } from "../../security/protocols.js";
+import type { MemoryService } from "../../agents/memory.js";
 import { readPrincipal } from "../auth.js";
 
 export interface OrchestratorLink {
@@ -24,6 +25,8 @@ export interface RouterDeps {
   repos: Repositories;
   /** Audit sink for prompt-injection inspections and trust decisions. */
   audit: AuditProvider;
+  /** Single authorized path for durable memory (Phase 4). */
+  memory?: MemoryService;
   orchestrator?: OrchestratorLink;
   /** Mints run-bound workload tokens by calling the STS (gateway side only). */
   sts?: RunTokenMinter;

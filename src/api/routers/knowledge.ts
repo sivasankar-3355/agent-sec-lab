@@ -1,8 +1,10 @@
 import { Router } from "express";
 import { z } from "zod";
+import { AuthorizationDeniedError, NotFoundError } from "../../core/errors.js";
 import { chunkText } from "../../core/chunking.js";
 import { stableHash } from "../../core/ids.js";
 import { newId } from "../../core/ids.js";
+import type { VectorSearchFilter } from "../../db/knowledge-contract.js";
 import type { RouterDeps } from "./contract.js";
 import { parseBody, readUserId, requireAuthorized } from "./contract.js";
 import { readPrincipal } from "../auth.js";
@@ -33,6 +35,18 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
     const body = parseBody(ingestSchema, req.body);
     const userId = readUserId(res);
 
+    // A run id is a reference to a trusted record. Verify the caller owns that
+    // run and take the tenant from the run, never from the request body.
+    let tenantId: string | undefined;
+    if (body.run_id !== undefined) {
+      const run = await deps.repos.runs.get(body.run_id);
+      if (!run) throw new NotFoundError("run not found");
+      if (run.userId !== undefined && run.userId !== userId) {
+        throw new AuthorizationDeniedError("run is not owned by the caller");
+      }
+      tenantId = run.tenantId;
+    }
+
     // Ingested content is untrusted. Detection is supplementary: the document
     // is stored as data with provenance/trust markers, never as instructions.
     const inspection = await inspectUntrustedContent(deps.audit, {
@@ -60,6 +74,8 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
       title: body.title ?? body.source,
       source: body.source,
       ...(body.run_id ? { runId: body.run_id } : {}),
+      ...(userId.length > 0 ? { ownerUserId: userId } : {}),
+      ...(tenantId !== undefined ? { tenantId } : {}),
       chunks: chunks.map((c) => ({ index: c.index, contentHash: c.contentHash })),
       vectors,
     });
@@ -72,6 +88,7 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
       contentHash,
       ...(body.run_id ? { runId: body.run_id } : {}),
       ...(userId.length > 0 ? { ownerUserId: userId } : {}),
+      ...(tenantId !== undefined ? { tenantId } : {}),
       metadata: {
         ...(body.metadata ?? {}),
         trust: "untrusted",
@@ -110,7 +127,12 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
     });
 
     const embedded = await deps.embedding.embed([query.q]);
-    const hits = await deps.repos.knowledge.search(embedded[0]!, query.limit);
+    // Server-side retrieval filter: owner + tenant are applied inside Qdrant,
+    // not after the fact. Per-document authorization below remains as defense
+    // in depth (and handles documents whose metadata changed after indexing).
+    const filter: VectorSearchFilter | undefined =
+      userId.length > 0 ? { ownerUserId: userId, includeUnowned: true } : undefined;
+    const hits = await deps.repos.knowledge.search(embedded[0]!, query.limit, filter);
 
     // ABAC: only return documents the user owns (or global knowledge), so an
     // authenticated user cannot read another user's documents.

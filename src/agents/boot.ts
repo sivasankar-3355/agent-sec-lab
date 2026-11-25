@@ -4,8 +4,10 @@ import { createLogger } from "../core/logger.js";
 import { buildSecurityProviders } from "../security/build.js";
 import { connectStores, disconnectStores } from "../api/deps.js";
 import { createRepositories } from "../db/repositories/build.js";
+import { createMemoriesRepository } from "../db/repositories/memory.js";
 import { createA2ARouter } from "../a2a/server.js";
 import { BaseWorkerHandler, type WorkerExecutor } from "./base.js";
+import { createMemoryService } from "./memory.js";
 import type { AgentKind, TaskKind } from "../a2a/schema.js";
 import { a2aAudience } from "../security/audience.js";
 
@@ -20,6 +22,12 @@ export async function bootWorker(
   const stores = await connectStores(config, log);
   const repos = await createRepositories(stores.mongo!, stores.qdrant!);
   const security = buildSecurityProviders(config, log);
+  const memory = createMemoryService({
+    repo: createMemoriesRepository(stores.mongo!.db()),
+    runs: repos.runs,
+    authz: security.authz,
+    audit: security.audit,
+  });
 
   const handler = new BaseWorkerHandler(
     agent,
@@ -29,6 +37,7 @@ export async function bootWorker(
       audit: security.audit,
       repos,
       security,
+      memory,
     },
     acceptedKinds,
   );

@@ -19,7 +19,14 @@ import type {
   TasksRepository,
   UsersRepository,
 } from "../../src/db/repositories/contracts.js";
-import type { KnowledgeVectorStore, VectorHit, UpsertChunksInput } from "../../src/db/knowledge-contract.js";
+import type { KnowledgeVectorStore, VectorHit, UpsertChunksInput, VectorSearchFilter } from "../../src/db/knowledge-contract.js";
+import type {
+  MemoriesRepository,
+  MemoryIsolation,
+  MemoryQuery,
+  MemoryUpdatePatch,
+} from "../../src/db/repositories/memory.js";
+import type { MemoryRecord } from "../../src/core/memory.js";
 import type { Coordinator } from "../../src/db/coordinator.js";
 import type { ChildTaskBroker } from "../../src/agents/orchestrator/broker.js";
 import type { A2ATask, A2AStatus, TaskInit } from "../../src/a2a/schema.js";
@@ -132,7 +139,7 @@ class TestAuthTokenProvider implements AuthTokenProvider {
       return {
         valid: true,
         principal: "tester",
-        scopes: ["runs:read", "runs:write", "knowledge:read", "knowledge:write"],
+        scopes: ["runs:read", "runs:write", "knowledge:read", "knowledge:write", "memory:read", "memory:write"],
       };
     }
     return { valid: false, reason: "invalid token" };
@@ -542,9 +549,123 @@ class FakeKnowledgeVectorStore implements KnowledgeVectorStore {
     this.chunks.push(input);
   }
 
-  async search(queryVector: readonly number[], limit: number): Promise<readonly VectorHit[]> {
+  async search(
+    _queryVector: readonly number[],
+    limit: number,
+    _filter?: VectorSearchFilter,
+  ): Promise<readonly VectorHit[]> {
     const docIds = [...new Set(this.chunks.map((c) => c.docId))];
     return docIds.slice(0, limit).map((docId) => ({ docId, score: 1 }));
+  }
+}
+
+function memoryVisible(record: MemoryRecord, isolation: MemoryIsolation): boolean {
+  if (record.ownerUserId !== isolation.ownerUserId) return false;
+  if (!isolation.scopes.includes(record.scope)) return false;
+  if (isolation.tenantId !== undefined && isolation.tenantId !== "") {
+    if (record.tenantId !== isolation.tenantId) return false;
+  } else if (record.tenantId !== undefined && record.tenantId !== "") {
+    return false;
+  }
+  if (record.scope === "run" && isolation.runId !== undefined && record.runId !== isolation.runId) return false;
+  if (record.scope === "agent" && isolation.agent !== undefined && record.agent !== isolation.agent) return false;
+  return true;
+}
+
+export class FakeMemoriesRepository implements MemoriesRepository {
+  readonly records: MemoryRecord[] = [];
+
+  async insert(record: MemoryRecord): Promise<MemoryRecord> {
+    this.records.push(record);
+    return record;
+  }
+
+  async get(memoryId: string): Promise<MemoryRecord | null> {
+    return this.records.find((record) => record.memoryId === memoryId) ?? null;
+  }
+
+  async findLatestByKey(input: {
+    ownerUserId: string;
+    tenantId?: string;
+    scope: MemoryRecord["scope"];
+    collection: string;
+    key: string;
+    runId?: string;
+    agent?: string;
+  }): Promise<MemoryRecord | null> {
+    const matches = this.records
+      .filter(
+        (record) =>
+          record.ownerUserId === input.ownerUserId &&
+          record.scope === input.scope &&
+          record.collection === input.collection &&
+          record.key === input.key &&
+          (input.tenantId !== undefined
+            ? record.tenantId === input.tenantId
+            : record.tenantId === undefined || record.tenantId === "") &&
+          (input.runId === undefined || record.runId === input.runId) &&
+          (input.agent === undefined || record.agent === input.agent),
+      )
+      .sort((a, b) => b.integrity.version - a.integrity.version);
+    return matches[0] ?? null;
+  }
+
+  async update(
+    memoryId: string,
+    isolation: MemoryIsolation,
+    patch: MemoryUpdatePatch,
+  ): Promise<MemoryRecord | null> {
+    const index = this.records.findIndex(
+      (record) => record.memoryId === memoryId && memoryVisible(record, isolation),
+    );
+    if (index < 0) return null;
+    const current = this.records[index]!;
+    if (patch.previousVersion !== undefined && current.integrity.version !== patch.previousVersion) {
+      return null;
+    }
+    const updated: MemoryRecord = {
+      ...current,
+      ...(patch.content !== undefined ? { content: patch.content } : {}),
+      ...(patch.contentHash !== undefined ? { contentHash: patch.contentHash } : {}),
+      ...(patch.key !== undefined && patch.key !== null ? { key: patch.key } : {}),
+      ...(patch.tags !== undefined ? { tags: [...patch.tags] } : {}),
+      ...(patch.conflict !== undefined ? { conflict: patch.conflict } : {}),
+      ...(patch.injection !== undefined ? { injection: patch.injection } : {}),
+      ...(patch.expiresAt !== undefined && patch.expiresAt !== null ? { expiresAt: patch.expiresAt } : {}),
+      integrity: {
+        version: patch.version,
+        ...(patch.previousVersion !== undefined ? { previousVersion: patch.previousVersion } : {}),
+      },
+      tsUpdated: isoNow(),
+    };
+    if (patch.key === null) delete (updated as { key?: string }).key;
+    if (patch.expiresAt === null) delete (updated as { expiresAt?: string }).expiresAt;
+    this.records[index] = updated;
+    return updated;
+  }
+
+  async remove(memoryId: string, isolation: MemoryIsolation): Promise<boolean> {
+    const index = this.records.findIndex(
+      (record) => record.memoryId === memoryId && memoryVisible(record, isolation),
+    );
+    if (index < 0) return false;
+    this.records.splice(index, 1);
+    return true;
+  }
+
+  async search(query: MemoryQuery): Promise<readonly MemoryRecord[]> {
+    const now = Date.now();
+    return this.records
+      .filter(
+        (record) =>
+          memoryVisible(record, query) &&
+          (record.expiresAt === undefined || Date.parse(record.expiresAt) > now) &&
+          (query.collection === undefined || record.collection === query.collection) &&
+          (query.key === undefined || record.key === query.key) &&
+          (query.q === undefined || query.q === "" || record.content.toLowerCase().includes(query.q.toLowerCase())),
+      )
+      .sort((a, b) => b.tsUpdated.localeCompare(a.tsUpdated))
+      .slice(0, Math.min(Math.max(query.limit, 1), 20));
   }
 }
 

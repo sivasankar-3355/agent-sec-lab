@@ -3,6 +3,7 @@ import { AppError, NotFoundError } from "../core/errors.js";
 import type { Repositories } from "../db/repositories/build.js";
 import type { AuditProvider, VerifiedContext } from "../security/protocols.js";
 import type { SecurityProviders } from "../security/container.js";
+import type { MemoryService } from "./memory.js";
 import { createAgentCard } from "../a2a/agentCard.js";
 import type { A2AHandler, CallContext } from "../a2a/handler.js";
 import {
@@ -25,6 +26,8 @@ export interface WorkerContext {
   audit: AuditProvider;
   repos: Repositories;
   security: SecurityProviders;
+  /** Authorized memory service; agents never get the raw memory repository. */
+  memory?: MemoryService;
 }
 
 export interface WorkerExecuteInput {

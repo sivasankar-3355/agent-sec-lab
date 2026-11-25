@@ -1,4 +1,6 @@
 import type { Repositories } from "../../db/repositories/build.js";
+import type { VectorSearchFilter } from "../../db/knowledge-contract.js";
+import { AuthorizationDeniedError } from "../../core/errors.js";
 import type {
   AuditProvider,
   AuthorizationProvider,
@@ -65,6 +67,11 @@ export interface SecureRetrievalResult {
  * - Retrieval only produces data; it cannot authorize or trigger a tool call.
  */
 export async function retrieveAuthorizedDocuments(input: SecureRetrievalInput): Promise<SecureRetrievalResult> {
+  // Fail closed: an authorized retrieval must have an owner identity to scope
+  // the server-side filter and the per-document check.
+  if (input.authz !== undefined && input.user === "") {
+    throw new AuthorizationDeniedError("retrieval requires an owning user identity");
+  }
   const requested = input.limit ?? 10;
   const limit = Math.min(Math.max(1, requested), MAX_RETRIEVAL_LIMIT);
 
@@ -84,7 +91,15 @@ export async function retrieveAuthorizedDocuments(input: SecureRetrievalInput): 
     return { documents: [], denied: 0, inspection };
   }
 
-  const hits = await input.repos.knowledge.search(queryVector, limit);
+  const filter: VectorSearchFilter | undefined =
+    input.user !== ""
+      ? {
+          ownerUserId: input.user,
+          includeUnowned: true,
+          ...(input.tenantId !== undefined ? { tenantId: input.tenantId } : {}),
+        }
+      : undefined;
+  const hits = await input.repos.knowledge.search(queryVector, limit, filter);
   const documents: RetrievedDocument[] = [];
   let denied = 0;
 

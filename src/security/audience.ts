@@ -21,7 +21,14 @@ export const INTERNAL_MINT_SCOPE = "internal:token-mint";
 export const RUN_ACTIONS: readonly string[] = ["run.start", "recon.run", "knowledge.search", "report.generate"];
 
 /** Scopes granted to an authenticated user by default (Phase 1; no IdP yet). */
-export const USER_SCOPES: readonly string[] = ["runs:create", "runs:read", "knowledge:read", "knowledge:write"];
+export const USER_SCOPES: readonly string[] = [
+  "runs:create",
+  "runs:read",
+  "knowledge:read",
+  "knowledge:write",
+  "memory:read",
+  "memory:write",
+];
 
 /** Which child audiences an orchestrator may exchange run credits for. */
 export const ALLOWED_CHILD_AUDIENCES: readonly string[] = ["a2a:recon", "a2a:knowledge", "a2a:report"];

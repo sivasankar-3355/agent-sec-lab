@@ -6,6 +6,8 @@ import { INTERNAL_MINT_SCOPE } from "../security/audience.js";
 import type { RunTokenMinter } from "../security/protocols.js";
 import { createApp } from "./app.js";
 import { buildRuntime, disconnectStores } from "./deps.js";
+import { createMemoriesRepository } from "../db/repositories/memory.js";
+import { createMemoryService } from "../agents/memory.js";
 
 /**
  * The gateway authenticates to the STS with its workload identity and receives
@@ -39,11 +41,19 @@ async function start(): Promise<void> {
   const security = buildSecurityProviders(config, log);
   const sts = await gatewaySTSClient(config, security, log);
 
+  const memory = createMemoryService({
+    repo: createMemoriesRepository(runtime.stores.mongo!.db()),
+    runs: runtime.repos.runs,
+    authz: security.authz,
+    audit: security.audit,
+  });
+
   const app = createApp({
     log,
     security,
     stores: runtime.stores,
     repos: runtime.repos,
+    memory,
     ...(config.ORCHESTRATOR_A2A_URL.length > 0 ? { orchestrator: { base: config.ORCHESTRATOR_A2A_URL } } : {}),
     ...(sts !== undefined ? { sts } : {}),
   });

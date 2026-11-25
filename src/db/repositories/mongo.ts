@@ -19,6 +19,7 @@ import type {
   TasksRepository,
   UsersRepository,
 } from "./contracts.js";
+import { ensureMemoryIndexes } from "./memory.js";
 
 type MongoDoc = {
   _id: string;
@@ -505,5 +506,6 @@ export async function ensureMongoSchema(db: Db): Promise<void> {
     db.collection("documents").createIndex({ contentHash: 1 }, { unique: true }),
     db.collection("users").createIndex({ email: 1 }, { unique: true }),
     db.collection("audit").createIndex({ ts: 1 }),
+    ensureMemoryIndexes(db),
   ]);
 }

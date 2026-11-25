@@ -31,6 +31,13 @@ knowledge_actions := {"knowledge.search", "knowledge.index"}
 report_actions := {"report.generate"}
 api_scopes := {"runs:create", "runs:read", "knowledge:write", "knowledge:read"}
 
+# ---------------------------------------------------------------- Memory -----
+# Memory is durable, untrusted context. Read/write are separate scopes and are
+# never covered by the generic API rule above: a memory record must have a
+# non-empty owner that matches the user (no "unowned means public" shortcut).
+memory_api_scopes := {"memory:read", "memory:write"}
+memory_actions := {"memory.read", "memory.write"}
+
 # ---------- A2A: discovery methods (any authenticated workload) ----------
 allow if {
   input.kind == "a2a"
@@ -158,6 +165,30 @@ allow if {
   resource_owned
 }
 
+# ---------- Memory API: explicit scope + strict owner/tenant match ----------
+allow if {
+  input.kind == "api"
+  input.attributes.action in memory_api_scopes
+  input.attributes.action in input.attributes.scopes
+  memory_owned
+  memory_tenant_matched
+}
+
+# ---------- Memory operations: run-bound agent context ----------
+# An agent may only touch memory granted by its run token, for its own run,
+# and only memory owned by the run's user. Memory content never appears in the
+# policy input, so it can never influence a decision.
+allow if {
+  input.kind == "operation"
+  input.attributes.action in memory_actions
+  input.attributes.agent != ""
+  input.attributes.requestedAction == input.attributes.action
+  input.attributes.requestedAction in input.attributes.approvedActions
+  input.attributes.requestedRunId == input.attributes.runId
+  memory_owned
+  memory_tenant_matched
+}
+
 # ---------- ABAC helpers ----------
 tenant_matched if {
   input.attributes.tenantId == ""
@@ -174,4 +205,19 @@ resource_owned if {
 
 resource_owned if {
   input.attributes.resourceOwner == input.attributes.user
+}
+
+# Memory is never "unowned": an empty resource owner does not make it public.
+memory_owned if {
+  input.attributes.resourceOwner != ""
+  input.attributes.resourceOwner == input.attributes.user
+}
+
+memory_tenant_matched if {
+  input.attributes.tenantId == ""
+  input.attributes.resourceTenantId == ""
+}
+
+memory_tenant_matched if {
+  input.attributes.resourceTenantId == input.attributes.tenantId
 }
