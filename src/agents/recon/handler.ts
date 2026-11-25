@@ -2,8 +2,25 @@ import { AppError, EgressDeniedError, PolicyViolationError } from "../../core/er
 import { newId, stableHash } from "../../core/ids.js";
 import type { WorkerContext, WorkerExecuteInput, WorkerExecutor } from "../base.js";
 import { assertAuthorized, workloadOfCaller } from "../authz.js";
+import { agentDeveloperPrompt, agentSystemPrompt } from "../prompts.js";
+import { reconSnapshotTool } from "../tools.js";
+import {
+  asDataText,
+  assemblePrompt,
+  auditPromptAssembly,
+  validateToolCall,
+} from "../../security/prompt/index.js";
 
 export const reconAcceptedKinds: readonly ["recon.run"] = ["recon.run"];
+
+function toolOutputText(output: unknown): string {
+  if (typeof output === "string") return output;
+  try {
+    return JSON.stringify(output) ?? String(output);
+  } catch {
+    return String(output);
+  }
+}
 
 export class ReconExecutor implements WorkerExecutor {
   async execute(ctx: WorkerContext, task: WorkerExecuteInput): Promise<Record<string, unknown>> {
@@ -22,22 +39,29 @@ export class ReconExecutor implements WorkerExecutor {
       }
     }
 
-    if (task.authz !== undefined) {
-      // Independent agent PEP: the central OPA must confirm the target is
-      // inside the approved scope of the *signed* run grant.
-      await assertAuthorized(ctx.security.authz, "recon.run", {
-        kind: "operation",
-        workload: workloadOfCaller(task.authz.caller),
-        agent: "recon",
-        ...(task.authz.userId !== "" ? { user: task.authz.userId } : {}),
-        runId: task.runId,
-        approvedTargets: task.authz.scopeTargets,
-        approvedActions: task.authz.permittedActions,
-        requestedAction: "recon.run",
-        requestedTarget: target,
-        ...(task.authz.tenantId !== undefined ? { tenantId: task.authz.tenantId } : {}),
-      });
-    }
+    const authorization =
+      task.authz !== undefined
+        ? await assertAuthorized(ctx.security.authz, "recon.run", {
+            kind: "operation",
+            workload: workloadOfCaller(task.authz.caller),
+            agent: "recon",
+            ...(task.authz.userId !== "" ? { user: task.authz.userId } : {}),
+            runId: task.runId,
+            approvedTargets: task.authz.scopeTargets,
+            approvedActions: task.authz.permittedActions,
+            requestedAction: "recon.run",
+            requestedTarget: target,
+            ...(task.authz.tenantId !== undefined ? { tenantId: task.authz.tenantId } : {}),
+          })
+        : undefined;
+
+    // Independent tool gate: the target is code-selected, but its arguments are
+    // still validated against a strict schema and the signed run grant before
+    // any sandbox step runs. Prompt content never participates in this call.
+    const snapshotCall = validateToolCall(reconSnapshotTool, { target }, {
+      ...(task.authz !== undefined ? { grant: task.authz } : {}),
+      ...(authorization !== undefined ? { decision: authorization } : {}),
+    });
 
     const rulesRef = typeof task.input.rulesRef === "string" && task.input.rulesRef.length > 0 ? task.input.rulesRef : undefined;
 
@@ -51,18 +75,39 @@ export class ReconExecutor implements WorkerExecutor {
       throw new EgressDeniedError(egress.reason ?? `egress to '${target}' denied`);
     }
 
-    const step = await ctx.security.sandbox.run({ name: "recon.snapshot", input: { target } });
+    const step = await ctx.security.sandbox.run({ name: reconSnapshotTool.name, input: snapshotCall });
     if (!step.ok) {
       throw new PolicyViolationError(`recon step failed: ${String(step.output)}`);
     }
 
+    // The target and the sandbox output are untrusted data. They are rendered
+    // inside an attributed UNTRUSTED_DATA envelope, never into instructions.
+    const assembly = assemblePrompt({
+      agent: "recon",
+      system: agentSystemPrompt("recon"),
+      developer: agentDeveloperPrompt("recon"),
+      task: "Summarize the reconnaissance observations for the approved target.",
+      untrusted: [
+        { tier: "user-request", source: "run.scope.target", content: target, maxChars: 2048 },
+        {
+          tier: "tool-output",
+          source: `tool:${reconSnapshotTool.name}`,
+          content: toolOutputText(step.output),
+        },
+      ],
+    });
+    void auditPromptAssembly(ctx.audit, assembly, {
+      runId: task.runId,
+      taskId: task.taskId,
+      ...(task.authz !== undefined && task.authz.userId !== "" ? { principal: task.authz.userId } : {}),
+    });
+
     let note = "";
     try {
-      const completion = await ctx.security.model.complete(
-        `Summarize the reconnaissance observations for target ${target}.`,
-        { target },
-      );
-      note = completion.text.slice(0, 2000);
+      const completion = await ctx.security.model.complete(assembly.prompt, assembly.context);
+      // Model output is also untrusted: normalize it before persistence so it
+      // cannot smuggle prompt-boundary or chat-template tokens into reports.
+      note = asDataText(completion.text, 2000);
     } catch {
       // model control not wired; reasoning is optional
     }

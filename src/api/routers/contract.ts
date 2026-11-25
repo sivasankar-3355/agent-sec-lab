@@ -4,6 +4,7 @@ import { z } from "zod";
 import { ValidationError, AuthorizationDeniedError } from "../../core/errors.js";
 import type { Repositories } from "../../db/repositories/build.js";
 import type {
+  AuditProvider,
   AuthzResource,
   AuthorizationProvider,
   EmbeddingProvider,
@@ -21,6 +22,8 @@ export interface RouterDeps {
   authz: AuthorizationProvider;
   embedding: EmbeddingProvider;
   repos: Repositories;
+  /** Audit sink for prompt-injection inspections and trust decisions. */
+  audit: AuditProvider;
   orchestrator?: OrchestratorLink;
   /** Mints run-bound workload tokens by calling the STS (gateway side only). */
   sts?: RunTokenMinter;

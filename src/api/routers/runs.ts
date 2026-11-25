@@ -8,6 +8,7 @@ import { A2AClient } from "../../a2a/client.js";
 import { A2A_SCOPES, RUN_ACTIONS } from "../../security/audience.js";
 import type { RouterDeps } from "./contract.js";
 import { parseBody, parseId, readUserId, requireAuthorized } from "./contract.js";
+import { inspectUntrustedContent } from "../../security/prompt/index.js";
 
 const runCreateSchema = z
   .object({
@@ -24,6 +25,24 @@ export function createRunsRouter(deps: RouterDeps): Router {
     await requireAuthorized(deps.authz, "runs:create", res);
     const body = parseBody(runCreateSchema, req.body);
     const userId = readUserId(res);
+
+    // The run name and declared targets are authenticated but attacker-
+    // controlled data. Inspect/audit them; they never become model instructions.
+    await inspectUntrustedContent(deps.audit, {
+      tier: "user-request",
+      source: "run.create.name",
+      content: body.name,
+      agent: "gateway",
+      ...(userId.length > 0 ? { principal: userId } : {}),
+    });
+    await inspectUntrustedContent(deps.audit, {
+      tier: "user-request",
+      source: "run.create.scope",
+      content: body.scope.targets.join("\n"),
+      agent: "gateway",
+      ...(userId.length > 0 ? { principal: userId } : {}),
+    });
+
     const run = await deps.repos.runs.create({
       name: body.name,
       scope: { targets: [...body.scope.targets] },

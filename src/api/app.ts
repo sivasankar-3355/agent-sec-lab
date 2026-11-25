@@ -62,6 +62,7 @@ export function createApp(deps: AppDeps): Application {
     authz: deps.security.authz,
     embedding: deps.security.embedding,
     repos: deps.repos,
+    audit: deps.security.audit,
     ...(deps.orchestrator !== undefined ? { orchestrator: deps.orchestrator } : {}),
     ...(deps.sts !== undefined ? { sts: deps.sts } : {}),
   };

@@ -1,7 +1,10 @@
 import { AppError } from "../../core/errors.js";
 import type { AuthzResource } from "../../security/protocols.js";
 import type { WorkerContext, WorkerExecuteInput, WorkerExecutor } from "../base.js";
-import { assertAuthorized, authorizeDocumentAccess, workloadOfCaller } from "../authz.js";
+import { assertAuthorized, workloadOfCaller } from "../authz.js";
+import { knowledgeIndexTool, knowledgeSearchTool } from "../tools.js";
+import { validateToolCall } from "../../security/prompt/index.js";
+import { retrieveAuthorizedDocuments } from "./retrieval.js";
 
 export const knowledgeAcceptedKinds: readonly ["knowledge.search", "knowledge.index"] = [
   "knowledge.search",
@@ -28,46 +31,62 @@ export class KnowledgeExecutor implements WorkerExecutor {
         const query = String(task.input.query);
         const user = task.authz?.userId ?? "";
 
-        if (task.authz !== undefined) {
-          await assertAuthorized(ctx.security.authz, "knowledge.search", {
-            ...opBase(task),
-            requestedAction: "knowledge.search",
-            requestedTarget: query,
-            // The un-scoped search is bounded to the actor's tenant; individual
-            // documents are then checked against their real tenant below.
-            ...(task.authz.tenantId !== undefined ? { resourceTenantId: task.authz.tenantId } : {}),
-          });
-        }
+        const authorization =
+          task.authz !== undefined
+            ? await assertAuthorized(ctx.security.authz, "knowledge.search", {
+                ...opBase(task),
+                requestedAction: "knowledge.search",
+                requestedTarget: query,
+                // The un-scoped search is bounded to the actor's tenant;
+                // individual documents are then checked against their real
+                // tenant by the retrieval boundary below.
+                ...(task.authz.tenantId !== undefined ? { resourceTenantId: task.authz.tenantId } : {}),
+              })
+            : undefined;
 
-        const vectors = await ctx.security.embedding.embed([query]);
-        const hits = await ctx.repos.knowledge.search(vectors[0]!, 10);
+        // Independent tool gate: strict query schema + signed-grant bound.
+        const searchCall = validateToolCall(knowledgeSearchTool, { query }, {
+          ...(task.authz !== undefined ? { grant: task.authz } : {}),
+          ...(authorization !== undefined ? { decision: authorization } : {}),
+        });
 
-        // ABAC: only return documents the user owns (or global knowledge).
-        const filtered: Array<{ docId: string; score: number }> = [];
-        for (const hit of hits) {
-          const doc = await ctx.repos.documents.get(hit.docId);
-          if (!doc) continue;
-          if (task.authz !== undefined) {
-            const accessible = await authorizeDocumentAccess({
-              authz: ctx.security.authz,
-              kind: "operation",
-              action: "knowledge.search",
-              user,
-              requestedObject: hit.docId,
-              resourceOwner: doc.ownerUserId ?? "",
-              resourceTenantId: doc.tenantId ?? "",
-              ...(task.authz.tenantId !== undefined ? { tenantId: task.authz.tenantId } : {}),
-            });
-            if (!accessible) continue;
-          }
-          filtered.push({ docId: hit.docId, score: hit.score });
-        }
-        return { hits: filtered };
+        // Secure RAG boundary: authorized documents only, provenance retained,
+        // results tagged as untrusted data.
+        const retrieval = await retrieveAuthorizedDocuments({
+          repos: ctx.repos,
+          embedding: ctx.security.embedding,
+          audit: ctx.audit,
+          query: searchCall.query,
+          limit: 10,
+          user,
+          ...(task.authz !== undefined ? { authz: ctx.security.authz } : {}),
+          ...(task.authz?.tenantId !== undefined ? { tenantId: task.authz.tenantId } : {}),
+          runId: task.runId,
+          taskId: task.taskId,
+          ...(task.authz !== undefined && task.authz.userId !== "" ? { principal: task.authz.userId } : {}),
+        });
+
+        return {
+          hits: retrieval.documents.map((document) => ({
+            docId: document.docId,
+            score: document.score,
+            trust: document.trust,
+            provenance: document.provenance,
+          })),
+          denied: retrieval.denied,
+        };
       }
       case "knowledge.index": {
-        const docIds = (task.input.docIds as string[]) ?? [];
+        // Strict, independent validation of the document set selected by code
+        // or by the caller; the model never chooses which documents to index.
+        const indexCall = validateToolCall(
+          knowledgeIndexTool,
+          { docIds: (task.input.docIds as string[]) ?? [] },
+          { ...(task.authz !== undefined ? { grant: task.authz } : {}) },
+        );
+
         const indexed: string[] = [];
-        for (const docId of docIds) {
+        for (const docId of indexCall.docIds) {
           const doc = await ctx.repos.documents.get(docId);
           if (!doc) continue;
           if (task.authz !== undefined) {

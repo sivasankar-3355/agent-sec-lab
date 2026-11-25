@@ -25,6 +25,10 @@ import { agentForKind, type ChildTaskBroker, type TokenExchanger } from "./broke
 import { assertTransition } from "./state.js";
 import { a2aAudience } from "../../security/audience.js";
 import { assertAuthorized } from "../authz.js";
+import { inspectUntrustedContent } from "../../security/prompt/index.js";
+
+/** Upper bound on a child artifact before it is parsed as data. */
+const MAX_CHILD_ARTIFACT_CHARS = 256 * 1024;
 
 export interface OrchestratorOptions {
   pollIntervalMs: number;
@@ -99,6 +103,16 @@ export class OrchestratorHandler implements A2AHandler {
     assertRunBound(ctx?.verified, message.runId, "message/send");
     const run = await this.repos.runs.get(message.runId);
     if (!run) throw new NotFoundError("run not found");
+    // Inbound agent messages are data, never instructions. Inspect/audit but
+    // never feed them into a trusted instruction section or act on advice.
+    await inspectUntrustedContent(this.audit, {
+      tier: "agent-output",
+      source: `agent-message:${message.agentId ?? "unknown"}`,
+      content: message.text,
+      agent: "orchestrator",
+      runId: message.runId,
+      taskId: message.taskId,
+    });
     return { message };
   }
 
@@ -318,7 +332,7 @@ export class OrchestratorHandler implements A2AHandler {
           await this.failRun(runId, rootTaskId, "child task completed without an artifact");
           return;
         }
-        const output = parseArtifact<Record<string, unknown>>(final.artifact);
+        const output = await this.ingestChildOutput(final, child.kind, runId);
         await this.repos.tasks.setStatus(child.taskId, "SUCCEEDED", { output });
       }
 
@@ -347,6 +361,35 @@ export class OrchestratorHandler implements A2AHandler {
       this.runTokens.delete(runId);
       this.runGrants.delete(runId);
     }
+  }
+
+  private async ingestChildOutput(task: A2ATask, kind: string, runId: string): Promise<Record<string, unknown>> {
+    const artifact = task.artifact;
+    if (artifact === undefined) throw new A2AError("child artifact missing");
+    if (artifact.text.length > MAX_CHILD_ARTIFACT_CHARS) {
+      throw new A2AError("child artifact exceeds the allowed size");
+    }
+    // Child output is untrusted data. It is inspected/audited and parsed as a
+    // bounded JSON object; recommendations in it are never executed and never
+    // affect authorization.
+    await inspectUntrustedContent(this.audit, {
+      tier: "agent-output",
+      source: `agent:${agentForKind(kind)}`,
+      content: artifact.text,
+      agent: "orchestrator",
+      runId,
+      taskId: task.taskId,
+    });
+    let parsed: unknown;
+    try {
+      parsed = parseArtifact<unknown>(artifact);
+    } catch {
+      throw new A2AError("child artifact is not valid JSON");
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new A2AError("child artifact must be a JSON object");
+    }
+    return parsed as Record<string, unknown>;
   }
 
   private async childToken(runId: string, kind: string): Promise<string> {

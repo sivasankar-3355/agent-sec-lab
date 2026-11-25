@@ -18,6 +18,7 @@ import {
   type TaskKind,
 } from "../a2a/schema.js";
 import type { AgentCard } from "../a2a/agentCard.js";
+import { inspectUntrustedContent } from "../security/prompt/index.js";
 
 export interface WorkerContext {
   log: Logger;
@@ -102,6 +103,17 @@ export class BaseWorkerHandler implements A2AHandler {
     if (bound !== undefined && bound.runId !== "" && message.runId !== bound.runId) {
       throw new AppError("forbidden", `message run '${message.runId}' outside authorized run '${bound.runId}'`, 403);
     }
+    // Other agents' messages are data. Inspect/audit suspicious content but do
+    // not treat it as an instruction or as a source of permission.
+    await inspectUntrustedContent(this.ctx.audit, {
+      tier: "agent-output",
+      source: `agent-message:${message.agentId ?? "unknown"}`,
+      content: message.text,
+      agent: this.agent,
+      runId: message.runId,
+      taskId: message.taskId,
+      ...(bound !== undefined && bound.userId !== "" ? { principal: bound.userId } : {}),
+    });
     return { message };
   }
 

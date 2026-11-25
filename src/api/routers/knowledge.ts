@@ -7,6 +7,7 @@ import type { RouterDeps } from "./contract.js";
 import { parseBody, readUserId, requireAuthorized } from "./contract.js";
 import { readPrincipal } from "../auth.js";
 import { authorizeDocumentAccess } from "../../agents/authz.js";
+import { inspectUntrustedContent } from "../../security/prompt/index.js";
 
 const ingestSchema = z
   .object({
@@ -31,6 +32,17 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
     await requireAuthorized(deps.authz, "knowledge:write", res);
     const body = parseBody(ingestSchema, req.body);
     const userId = readUserId(res);
+
+    // Ingested content is untrusted. Detection is supplementary: the document
+    // is stored as data with provenance/trust markers, never as instructions.
+    const inspection = await inspectUntrustedContent(deps.audit, {
+      tier: "external",
+      source: `knowledge.ingest:${body.source}`,
+      content: body.content,
+      agent: "gateway",
+      ...(body.run_id !== undefined ? { runId: body.run_id } : {}),
+      ...(userId.length > 0 ? { principal: userId } : {}),
+    });
 
     const contentHash = stableHash(body.content);
     const existing = await deps.repos.documents.getByContentHash(contentHash);
@@ -60,7 +72,20 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
       contentHash,
       ...(body.run_id ? { runId: body.run_id } : {}),
       ...(userId.length > 0 ? { ownerUserId: userId } : {}),
-      metadata: body.metadata ?? {},
+      metadata: {
+        ...(body.metadata ?? {}),
+        trust: "untrusted",
+        provenance: {
+          source: body.source,
+          ...(body.run_id !== undefined ? { runId: body.run_id } : {}),
+          ...(userId.length > 0 ? { ownerUserId: userId } : {}),
+        },
+        injection: {
+          suspicious: inspection.result.suspicious,
+          score: inspection.result.score,
+          categories: inspection.result.signals.map((signal) => signal.category),
+        },
+      },
     });
     await deps.repos.documents.markIndexed(docId, chunks.length);
 
@@ -71,15 +96,32 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
   router.get("/knowledge/search", async (req, res) => {
     await requireAuthorized(deps.authz, "knowledge:read", res);
     const query = parseBody(searchSchema, req.query);
+    const principal = readPrincipal(res);
+    const userId = readUserId(res);
+
+    // The query is user-supplied data; inspect/audit it and keep retrieval
+    // bounded by the code-owned limit in the request schema.
+    await inspectUntrustedContent(deps.audit, {
+      tier: "user-request",
+      source: "knowledge.search.query",
+      content: query.q,
+      agent: "gateway",
+      ...(userId.length > 0 ? { principal: userId } : {}),
+    });
 
     const embedded = await deps.embedding.embed([query.q]);
     const hits = await deps.repos.knowledge.search(embedded[0]!, query.limit);
 
     // ABAC: only return documents the user owns (or global knowledge), so an
     // authenticated user cannot read another user's documents.
-    const principal = readPrincipal(res);
-    const userId = readUserId(res);
-    const visible: Array<{ doc_id: string; score: number; snippet: null }> = [];
+    const visible: Array<{
+      doc_id: string;
+      score: number;
+      snippet: null;
+      source: string;
+      title: string;
+      trust: "untrusted";
+    }> = [];
     for (const hit of hits) {
       const doc = await deps.repos.documents.get(hit.docId);
       if (!doc) continue;
@@ -94,7 +136,15 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
         scopes: principal?.scopes ?? [],
       });
       if (!allowed) continue;
-      visible.push({ doc_id: hit.docId, score: hit.score, snippet: null });
+      // Preserve provenance and mark the retrieved content as untrusted data.
+      visible.push({
+        doc_id: hit.docId,
+        score: hit.score,
+        snippet: null,
+        source: doc.source,
+        title: doc.title,
+        trust: "untrusted",
+      });
     }
 
     res.status(200).json({ hits: visible });

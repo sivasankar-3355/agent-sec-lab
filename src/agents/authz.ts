@@ -1,5 +1,5 @@
 import { AppError } from "../core/errors.js";
-import type { AuthorizationProvider, AuthzResource } from "../security/protocols.js";
+import type { AuthorizationProvider, AuthzResource, Decision } from "../security/protocols.js";
 
 /** Extract the workload name from a verified caller ("workload:recon" -> "recon"). */
 export function workloadOfCaller(caller: string | undefined): string {
@@ -17,13 +17,14 @@ export async function assertAuthorized(
   authz: AuthorizationProvider,
   action: string,
   resource: AuthzResource,
-): Promise<void> {
+): Promise<Decision> {
   const decision = await authz.authorize(action, resource);
   if (!decision.allowed) {
     throw new AppError("forbidden", decision.reason ?? `operation '${action}' is not authorized`, 403, [
       decision.rule ?? "denied-by-policy",
     ]);
   }
+  return decision;
 }
 
 export interface DocumentAccessQuery {
