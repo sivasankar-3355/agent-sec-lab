@@ -1,21 +1,31 @@
 import type { MongoStore } from "../mongo.js";
-import type { QdrantStore } from "../qdrant.js";
 import { createMongoRepositories, ensureMongoSchema } from "./mongo.js";
-import { QdrantKnowledgeVectorStore } from "../knowledge.js";
-import type { KnowledgeVectorStore } from "../knowledge-contract.js";
-import type { DocumentsRepository, FindingsRepository, ReportsRepository, RunsRepository, TasksRepository, UsersRepository } from "./contracts.js";
+import type {
+  FindingsRepository,
+  ReportsRepository,
+  RunsRepository,
+  TasksRepository,
+  UsersRepository,
+} from "./contracts.js";
 
+/**
+ * Operational repositories available to agents and the gateway.
+ *
+ * Memory-related stores (`memories`, `documents`, the Qdrant knowledge
+ * collection) are deliberately absent: they are constructed only by
+ * `createMemoryStores` and owned privately by `MemoryService`. This makes
+ * `ctx.repos.documents` / `ctx.repos.knowledge` a compile error, so there is no
+ * alternate repository path to memory.
+ */
 export interface Repositories {
   runs: RunsRepository;
   users: UsersRepository;
   tasks: TasksRepository;
   findings: FindingsRepository;
   reports: ReportsRepository;
-  documents: DocumentsRepository;
-  knowledge: KnowledgeVectorStore;
 }
 
-export async function createRepositories(mongo: MongoStore, qdrant: QdrantStore): Promise<Repositories> {
+export async function createRepositories(mongo: MongoStore): Promise<Repositories> {
   const db = mongo.db();
   await ensureMongoSchema(db);
 
@@ -26,7 +36,5 @@ export async function createRepositories(mongo: MongoStore, qdrant: QdrantStore)
     tasks: base.tasks,
     findings: base.findings,
     reports: base.reports,
-    documents: base.documents,
-    knowledge: new QdrantKnowledgeVectorStore(qdrant),
   };
 }

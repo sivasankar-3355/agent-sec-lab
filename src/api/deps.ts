@@ -32,7 +32,7 @@ export async function connectStores(config: Config, log: Logger): Promise<Stores
 
 export async function buildRuntime(config: Config, log: Logger): Promise<Runtime> {
   const stores = await connectStores(config, log);
-  const repos = await createRepositories(stores.mongo!, stores.qdrant!);
+  const repos = await createRepositories(stores.mongo!);
   return { config, log, stores, repos };
 }
 

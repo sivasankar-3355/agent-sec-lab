@@ -1,15 +1,9 @@
 import { Router } from "express";
 import { z } from "zod";
-import { AuthorizationDeniedError, NotFoundError } from "../../core/errors.js";
-import { chunkText } from "../../core/chunking.js";
-import { stableHash } from "../../core/ids.js";
-import { newId } from "../../core/ids.js";
-import type { VectorSearchFilter } from "../../db/knowledge-contract.js";
 import type { RouterDeps } from "./contract.js";
-import { parseBody, readUserId, requireAuthorized } from "./contract.js";
-import { readPrincipal } from "../auth.js";
-import { authorizeDocumentAccess } from "../../agents/authz.js";
-import { inspectUntrustedContent } from "../../security/prompt/index.js";
+import { parseBody, readMemoryActor, readUserId, requireAuthorized } from "./contract.js";
+import { NotConfiguredError } from "../../core/errors.js";
+import type { MemoryService } from "../../agents/memory.js";
 
 const ingestSchema = z
   .object({
@@ -22,154 +16,68 @@ const ingestSchema = z
   })
   .strict();
 
-const searchSchema = z.object({
-  q: z.string().trim().min(1).max(2000),
-  limit: z.coerce.number().int().min(1).max(100).default(10),
-}).strict();
+const searchSchema = z
+  .object({
+    q: z.string().trim().min(1).max(2000),
+    limit: z.coerce.number().int().min(1).max(50).default(10),
+  })
+  .strict();
+
+function serviceOf(deps: RouterDeps): MemoryService {
+  if (deps.memory === undefined) throw new NotConfiguredError("memory service is not configured");
+  return deps.memory;
+}
 
 export function createKnowledgeRouter(deps: RouterDeps): Router {
   const router = Router();
 
   router.post("/knowledge/documents", async (req, res) => {
-    await requireAuthorized(deps.authz, "knowledge:write", res);
-    const body = parseBody(ingestSchema, req.body);
     const userId = readUserId(res);
+    await requireAuthorized(deps.authz, "knowledge:write", res, { resourceOwner: userId });
+    const body = parseBody(ingestSchema, req.body);
 
-    // A run id is a reference to a trusted record. Verify the caller owns that
-    // run and take the tenant from the run, never from the request body.
-    let tenantId: string | undefined;
-    if (body.run_id !== undefined) {
-      const run = await deps.repos.runs.get(body.run_id);
-      if (!run) throw new NotFoundError("run not found");
-      if (run.userId !== undefined && run.userId !== userId) {
-        throw new AuthorizationDeniedError("run is not owned by the caller");
-      }
-      tenantId = run.tenantId;
-    }
-
-    // Ingested content is untrusted. Detection is supplementary: the document
-    // is stored as data with provenance/trust markers, never as instructions.
-    const inspection = await inspectUntrustedContent(deps.audit, {
-      tier: "external",
-      source: `knowledge.ingest:${body.source}`,
+    // All admission, provenance, trust, embedding and storage happen inside the
+    // Memory Service. The gateway never touches MongoDB or Qdrant directly.
+    const result = await serviceOf(deps).ingestDocument(readMemoryActor(res), {
+      source: body.source,
       content: body.content,
-      agent: "gateway",
-      ...(body.run_id !== undefined ? { runId: body.run_id } : {}),
-      ...(userId.length > 0 ? { principal: userId } : {}),
-    });
-
-    const contentHash = stableHash(body.content);
-    const existing = await deps.repos.documents.getByContentHash(contentHash);
-    if (existing) {
-      res.status(200).json({ doc_id: existing.docId, chunk_count: existing.chunkCount, deduped: true });
-      return;
-    }
-
-    const chunks = chunkText(body.content);
-    const vectors = await deps.embedding.embed(chunks.map((c) => c.text));
-
-    const docId = newId();
-    await deps.repos.knowledge.upsertChunks({
-      docId,
-      title: body.title ?? body.source,
-      source: body.source,
-      ...(body.run_id ? { runId: body.run_id } : {}),
-      ...(userId.length > 0 ? { ownerUserId: userId } : {}),
-      ...(tenantId !== undefined ? { tenantId } : {}),
-      chunks: chunks.map((c) => ({ index: c.index, contentHash: c.contentHash })),
-      vectors,
-    });
-
-    await deps.repos.documents.create({
-      docId,
-      source: body.source,
-      title: body.title ?? body.source,
       contentType: body.content_type,
-      contentHash,
-      ...(body.run_id ? { runId: body.run_id } : {}),
-      ...(userId.length > 0 ? { ownerUserId: userId } : {}),
-      ...(tenantId !== undefined ? { tenantId } : {}),
-      metadata: {
-        ...(body.metadata ?? {}),
-        trust: "untrusted",
-        provenance: {
-          source: body.source,
-          ...(body.run_id !== undefined ? { runId: body.run_id } : {}),
-          ...(userId.length > 0 ? { ownerUserId: userId } : {}),
-        },
-        injection: {
-          suspicious: inspection.result.suspicious,
-          score: inspection.result.score,
-          categories: inspection.result.signals.map((signal) => signal.category),
-        },
-      },
+      ...(body.title !== undefined ? { title: body.title } : {}),
+      ...(body.run_id !== undefined ? { runId: body.run_id } : {}),
+      ...(body.metadata !== undefined ? { metadata: body.metadata } : {}),
     });
-    await deps.repos.documents.markIndexed(docId, chunks.length);
 
-    deps.log.info({ docId, chunkCount: chunks.length }, "document indexed");
-    res.status(201).json({ doc_id: docId, chunk_count: chunks.length });
+    deps.log.info({ docId: result.docId, chunkCount: result.chunkCount }, "document indexed");
+    res.status(result.deduped ? 200 : 201).json({
+      ...(result.docId !== "" ? { doc_id: result.docId } : {}),
+      chunk_count: result.chunkCount,
+      ...(result.deduped ? { deduped: true } : {}),
+    });
   });
 
   router.get("/knowledge/search", async (req, res) => {
-    await requireAuthorized(deps.authz, "knowledge:read", res);
-    const query = parseBody(searchSchema, req.query);
-    const principal = readPrincipal(res);
     const userId = readUserId(res);
+    await requireAuthorized(deps.authz, "knowledge:read", res, { resourceOwner: userId });
+    const query = parseBody(searchSchema, req.query);
 
-    // The query is user-supplied data; inspect/audit it and keep retrieval
-    // bounded by the code-owned limit in the request schema.
-    await inspectUntrustedContent(deps.audit, {
-      tier: "user-request",
-      source: "knowledge.search.query",
-      content: query.q,
-      agent: "gateway",
-      ...(userId.length > 0 ? { principal: userId } : {}),
+    // Server-side owner/tenant filtering, per-document authorization and
+    // untrusted provenance all happen in the Memory Service.
+    const result = await serviceOf(deps).searchDocuments(readMemoryActor(res), {
+      query: query.q,
+      limit: query.limit,
     });
 
-    const embedded = await deps.embedding.embed([query.q]);
-    // Server-side retrieval filter: owner + tenant are applied inside Qdrant,
-    // not after the fact. Per-document authorization below remains as defense
-    // in depth (and handles documents whose metadata changed after indexing).
-    const filter: VectorSearchFilter | undefined =
-      userId.length > 0 ? { ownerUserId: userId, includeUnowned: true } : undefined;
-    const hits = await deps.repos.knowledge.search(embedded[0]!, query.limit, filter);
-
-    // ABAC: only return documents the user owns (or global knowledge), so an
-    // authenticated user cannot read another user's documents.
-    const visible: Array<{
-      doc_id: string;
-      score: number;
-      snippet: null;
-      source: string;
-      title: string;
-      trust: "untrusted";
-    }> = [];
-    for (const hit of hits) {
-      const doc = await deps.repos.documents.get(hit.docId);
-      if (!doc) continue;
-      const allowed = await authorizeDocumentAccess({
-        authz: deps.authz,
-        kind: "api",
-        action: "knowledge:read",
-        user: userId,
-        requestedObject: hit.docId,
-        resourceOwner: doc.ownerUserId ?? "",
-        resourceTenantId: doc.tenantId ?? "",
-        scopes: principal?.scopes ?? [],
-      });
-      if (!allowed) continue;
-      // Preserve provenance and mark the retrieved content as untrusted data.
-      visible.push({
-        doc_id: hit.docId,
-        score: hit.score,
+    res.status(200).json({
+      hits: result.documents.map((document) => ({
+        doc_id: document.docId,
+        score: document.score,
         snippet: null,
-        source: doc.source,
-        title: doc.title,
-        trust: "untrusted",
-      });
-    }
-
-    res.status(200).json({ hits: visible });
+        source: document.provenance.source,
+        title: document.provenance.title,
+        trust: document.trust,
+      })),
+      denied: result.denied,
+    });
   });
 
   return router;

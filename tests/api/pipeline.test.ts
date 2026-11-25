@@ -18,6 +18,8 @@ import { STSClient } from "../../src/a2a/sts.js";
 import {
   FakeRepositories,
   FakeCoordinator,
+  FakeMemoryStores,
+  makeMemoryService,
   makeTestIdentity,
   TestSecretProvider,
   opaSecurity,
@@ -53,6 +55,7 @@ const apps = {
   orchestrator: workerSecurity(),
 };
 const repos = new FakeRepositories();
+const memoryStores = new FakeMemoryStores();
 const coordinator = new FakeCoordinator();
 
 let orchestrator: OrchestratorHandler;
@@ -87,7 +90,13 @@ async function bootAgent(handler: A2AHandler, security: FailClosedSecurityProvid
   return bootServer(app);
 }
 
-const workerCtx = (security: FailClosedSecurityProviders) => ({ log, audit: security.audit, repos, security });
+const workerCtx = (security: FailClosedSecurityProviders) => ({
+  log,
+  audit: security.audit,
+  repos,
+  security,
+  memory: makeMemoryService(security, repos.runs, memoryStores),
+});
 
 beforeAll(async () => {
   const reconUrl = await bootAgent(

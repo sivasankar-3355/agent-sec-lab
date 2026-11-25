@@ -481,7 +481,6 @@ export function createMongoRepositories(db: Db): {
   tasks: TasksRepository;
   findings: FindingsRepository;
   reports: ReportsRepository;
-  documents: DocumentsRepository;
   users: UsersRepository;
 } {
   return {
@@ -490,8 +489,12 @@ export function createMongoRepositories(db: Db): {
     tasks: new MongoTasksRepository(db),
     findings: new MongoFindingsRepository(db),
     reports: new MongoReportsRepository(db),
-    documents: new MongoDocumentsRepository(db),
   };
+}
+
+/** Memory-owned document repository. Not part of the operational `Repositories`. */
+export function createDocumentsRepository(db: Db): DocumentsRepository {
+  return new MongoDocumentsRepository(db);
 }
 
 export async function ensureMongoSchema(db: Db): Promise<void> {

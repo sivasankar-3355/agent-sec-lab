@@ -6,7 +6,7 @@ import { INTERNAL_MINT_SCOPE } from "../security/audience.js";
 import type { RunTokenMinter } from "../security/protocols.js";
 import { createApp } from "./app.js";
 import { buildRuntime, disconnectStores } from "./deps.js";
-import { createMemoriesRepository } from "../db/repositories/memory.js";
+import { createMemoryStores } from "../db/memory-store.js";
 import { createMemoryService } from "../agents/memory.js";
 
 /**
@@ -42,10 +42,11 @@ async function start(): Promise<void> {
   const sts = await gatewaySTSClient(config, security, log);
 
   const memory = createMemoryService({
-    repo: createMemoriesRepository(runtime.stores.mongo!.db()),
+    stores: createMemoryStores(runtime.stores.mongo!, runtime.stores.qdrant!),
     runs: runtime.repos.runs,
     authz: security.authz,
     audit: security.audit,
+    embedding: security.embedding,
   });
 
   const app = createApp({

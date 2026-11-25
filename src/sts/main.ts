@@ -2,7 +2,6 @@ import { loadConfig } from "../core/config.js";
 import { createLogger } from "../core/logger.js";
 import { buildSecurityProviders } from "../security/build.js";
 import { MongoStore } from "../db/mongo.js";
-import { QdrantStore } from "../db/qdrant.js";
 import { createRepositories } from "../db/repositories/build.js";
 import { createSTSApp } from "./app.js";
 
@@ -13,8 +12,7 @@ async function start(): Promise<void> {
   // The STS needs MongoDB read access to validate the trusted run record.
   const mongo = new MongoStore(config.MONGODB_URI, config.MONGODB_DB);
   await mongo.connect();
-  const qdrant = new QdrantStore(config.QDRANT_URL);
-  const repos = await createRepositories(mongo, qdrant);
+  const repos = await createRepositories(mongo);
 
   // STS_PRIVATE_KEY + STS_PUBLIC_KEY(S) must be configured; otherwise the
   // tokenIssuer is absent and every mint/exchange endpoint fails closed.

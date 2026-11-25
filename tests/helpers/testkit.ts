@@ -27,6 +27,8 @@ import type {
   MemoryUpdatePatch,
 } from "../../src/db/repositories/memory.js";
 import type { MemoryRecord } from "../../src/core/memory.js";
+import type { MemoryStores } from "../../src/db/memory-store.js";
+import { createMemoryService, type MemoryService } from "../../src/agents/memory.js";
 import type { Coordinator } from "../../src/db/coordinator.js";
 import type { ChildTaskBroker } from "../../src/agents/orchestrator/broker.js";
 import type { A2ATask, A2AStatus, TaskInit } from "../../src/a2a/schema.js";
@@ -796,6 +798,25 @@ export class FakeRepositories implements Repositories {
   readonly tasks = new FakeTasksRepository();
   readonly findings = new FakeFindingsRepository();
   readonly reports = new FakeReportsRepository();
+}
+
+/** Memory-owned stores used by `MemoryService` in tests. */
+export class FakeMemoryStores implements MemoryStores {
+  readonly memories = new FakeMemoriesRepository();
   readonly documents = new FakeDocumentsRepository();
   readonly knowledge = new FakeKnowledgeVectorStore();
+}
+
+export function makeMemoryService(
+  security: FailClosedSecurityProviders,
+  runs: RunsRepository,
+  stores: MemoryStores = new FakeMemoryStores(),
+): MemoryService {
+  return createMemoryService({
+    stores,
+    runs,
+    authz: security.authz,
+    audit: security.audit,
+    embedding: security.embedding,
+  });
 }

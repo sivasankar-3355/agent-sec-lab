@@ -4,7 +4,7 @@ import { createLogger } from "../core/logger.js";
 import { buildSecurityProviders } from "../security/build.js";
 import { connectStores, disconnectStores } from "../api/deps.js";
 import { createRepositories } from "../db/repositories/build.js";
-import { createMemoriesRepository } from "../db/repositories/memory.js";
+import { createMemoryStores } from "../db/memory-store.js";
 import { createA2ARouter } from "../a2a/server.js";
 import { BaseWorkerHandler, type WorkerExecutor } from "./base.js";
 import { createMemoryService } from "./memory.js";
@@ -20,13 +20,14 @@ export async function bootWorker(
   const log = createLogger(config.LOG_LEVEL);
 
   const stores = await connectStores(config, log);
-  const repos = await createRepositories(stores.mongo!, stores.qdrant!);
+  const repos = await createRepositories(stores.mongo!);
   const security = buildSecurityProviders(config, log);
   const memory = createMemoryService({
-    repo: createMemoriesRepository(stores.mongo!.db()),
+    stores: createMemoryStores(stores.mongo!, stores.qdrant!),
     runs: repos.runs,
     authz: security.authz,
     audit: security.audit,
+    embedding: security.embedding,
   });
 
   const handler = new BaseWorkerHandler(

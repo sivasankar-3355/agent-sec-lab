@@ -17,8 +17,10 @@ import {
 } from "../../src/security/audience.js";
 import type { FailClosedSecurityProviders } from "../../src/security/defaults.js";
 import {
+  FakeMemoryStores,
   FakeRepositories,
   TestAuditProvider,
+  makeMemoryService,
   makeTestIdentity,
   opaSecurity,
 } from "../helpers/testkit.js";
@@ -36,8 +38,19 @@ function security(policyDir?: string, audit?: TestAuditProvider): FailClosedSecu
   });
 }
 
-function workerApp(agent: WorkerAgent, sec: FailClosedSecurityProviders, repos: FakeRepositories): Application {
-  const ctx: WorkerContext = { log, audit: sec.audit, repos, security: sec };
+function workerApp(
+  agent: WorkerAgent,
+  sec: FailClosedSecurityProviders,
+  repos: FakeRepositories,
+  stores: FakeMemoryStores = new FakeMemoryStores(),
+): Application {
+  const ctx: WorkerContext = {
+    log,
+    audit: sec.audit,
+    repos,
+    security: sec,
+    memory: makeMemoryService(sec, repos.runs, stores),
+  };
   const handler =
     agent === "recon"
       ? new BaseWorkerHandler("recon", new ReconExecutor(), ctx, reconAcceptedKinds)
@@ -149,8 +162,9 @@ describe("Phase-2 privilege escalation scenarios", () => {
 
   it("S3: denies knowledge indexing another tenant's document", async () => {
     const repos = new FakeRepositories();
+    const stores = new FakeMemoryStores();
     const sec = security();
-    const doc = await repos.documents.create({
+    const doc = await stores.documents.create({
       docId: newId(),
       source: "s",
       title: "t",
@@ -170,13 +184,22 @@ describe("Phase-2 privilege escalation scenarios", () => {
     });
 
     await expect(
-      new KnowledgeExecutor().execute({ log, audit: sec.audit, repos, security: sec }, {
-        taskId: newId(),
-        runId,
-        kind: "knowledge.index",
-        input: { docIds: [doc.docId] },
-        authz: grant.context,
-      }),
+      new KnowledgeExecutor().execute(
+        {
+          log,
+          audit: sec.audit,
+          repos,
+          security: sec,
+          memory: makeMemoryService(sec, repos.runs, stores),
+        },
+        {
+          taskId: newId(),
+          runId,
+          kind: "knowledge.index",
+          input: { docIds: [doc.docId] },
+          authz: grant.context,
+        },
+      ),
     ).rejects.toMatchObject({ status: 403 });
   });
 

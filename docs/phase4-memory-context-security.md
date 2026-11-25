@@ -57,7 +57,8 @@ content stores were `documents` (Mongo) + the `knowledge` vector collection
 |---|---|
 | `src/core/memory.ts` | Memory domain model: source types, scopes, provenance, integrity/version, trust derivation, collection derivation, limits, retention, expiry, snippet bounding, best-effort secret redaction |
 | `src/db/repositories/memory.ts` | MongoDB `memories` repository with mandatory isolation predicates, version-pinned updates, TTL index, bounded search, append-only lineage |
-| `src/agents/memory.ts` | `MemoryService` — the only application path for memory I/O: authorization, identity/tenant/run derivation, poisoning rules, lifecycle, audit |
+| `src/agents/memory.ts` | `MemoryService` — the only application path for memory and knowledge document I/O: authorization, identity/tenant/run derivation, admission, Qdrant filtering, poisoning rules, lifecycle, audit |
+| `src/db/memory-store.ts` | The single wiring point for memory-owned MongoDB (`memories`, `documents`) and Qdrant (`knowledge`) stores; kept out of `Repositories` |
 | `src/api/routers/memory.ts` | `/memory` insert/read/search/update/delete endpoints with strict schemas |
 | `tests/api/memory.test.ts` | Functional control tests for CRUD, provenance/trust derivation, run binding, retention clamping, default-deny, real OPA policy |
 | `tests/unit/memory-model.test.ts` | Unit tests for trust/source derivation, retention clamping, content/snippet bounds, expiry |
@@ -69,18 +70,60 @@ content stores were `documents` (Mongo) + the `knowledge` vector collection
 |---|---|
 | `policies/v1/authz.rego` | Memory API/operation rules, strict `memory_owned` (empty owner is never public), memory tenant matching; memory scopes excluded from the generic API rule |
 | `src/security/audience.ts` | Adds `memory:read` / `memory:write` to default user scopes |
-| `src/api/routers/contract.ts` | `RouterDeps.memory` |
+| `src/api/routers/contract.ts` | `RouterDeps.memory` + `readMemoryActor` helper |
 | `src/api/app.ts` | `AppDeps.memory` + registers the memory router |
-| `src/api/main.ts` | Builds `MemoryService` from the MongoDB memory repository |
-| `src/agents/base.ts` | `WorkerContext.memory` (agents see the service, never the raw repository) |
-| `src/agents/boot.ts` | Builds the memory service for every worker |
-| `src/db/repositories/mongo.ts` | Ensures memory indexes (owner/scope, key/version, TTL) |
+| `src/api/main.ts` | Builds `MemoryService` over `createMemoryStores` |
+| `src/agents/base.ts` | `WorkerContext.memory` (agents see the service, never the raw stores) |
+| `src/agents/boot.ts` | Builds one `MemoryService` per worker over the shared memory stores |
+| `src/agents/knowledge/handler.ts` | Uses `ctx.memory.searchDocuments` / `indexDocuments`; no direct document/Qdrant repository access |
+| `src/agents/knowledge/retrieval.ts` | Removed; retrieval logic now lives inside `MemoryService.searchDocuments` |
+| `src/db/repositories/build.ts` | `Repositories` narrowed to operational stores only (no documents/knowledge/memories) |
+| `src/db/repositories/mongo.ts` | Exposes `createDocumentsRepository`; `createMongoRepositories` no longer returns documents |
 | `src/db/knowledge-contract.ts` | Typed `VectorSearchFilter`, owner/tenant in `UpsertChunksInput`, filtered `search` signature |
 | `src/db/knowledge.ts` | Qdrant payload owner/tenant, server-side filter translation, payload indexes, hard result cap |
-| `src/agents/knowledge/retrieval.ts` | Fail-closed owner requirement, server-side filter, unchanged per-document authorization |
-| `src/api/routers/knowledge.ts` | Verifies run ownership on ingest, stamps owner/tenant on documents and vectors, server-side search filter |
+| `src/api/routers/knowledge.ts` | Delegates ingest/search entirely to `MemoryService`; no direct MongoDB/Qdrant access |
 | `src/api/routers/reports.ts` | Enforces run ownership/tenant when reading a report |
-| `tests/helpers/testkit.ts` | Fake memory repository + filtered vector-store signature |
+| `src/api/deps.ts`, `src/orchestrator/main.ts`, `src/sts/main.ts` | Updated for the narrowed `createRepositories` signature |
+| `tests/helpers/testkit.ts` | `FakeMemoryStores` + `makeMemoryService`; `FakeRepositories` no longer holds memory stores |
+
+## 3.1 Centralized Memory Service (Option A)
+
+**Decision:** the Memory Service is an **in-process module of the existing
+application**, not a separate deployment. It is the only component that owns
+the memory-related MongoDB collections (`memories`, `documents`) and the Qdrant
+`knowledge` collection.
+
+```
+Recon Agent ─┐
+Knowledge Agent ─┼──> MemoryService ──> MongoDB (memories, documents)
+Report Agent ───┘                  └──> Qdrant (knowledge vectors)
+```
+
+| Concern | Location |
+|---|---|
+| Service implementation | `src/agents/memory.ts` (`MemoryService`) |
+| Memory-owned stores | `src/db/memory-store.ts` (`createMemoryStores`) |
+| MongoDB memory repo | `src/db/repositories/memory.ts` |
+| MongoDB documents repo | `src/db/repositories/mongo.ts` (`createDocumentsRepository`) |
+| Qdrant knowledge adapter | `src/db/knowledge.ts` |
+
+Access is centralized as follows:
+
+- `Repositories` contains only operational stores (`runs`, `users`, `tasks`,
+  `findings`, `reports`). `documents`, the Qdrant knowledge store and the memory
+  repository are **not** part of it, so `ctx.repos.documents` /
+  `ctx.repos.knowledge` do not compile.
+- `createMemoryStores` is the only wiring point for the memory-owned stores.
+  It is called in `src/api/main.ts` and `src/agents/boot.ts`; the resulting
+  object is held privately by `MemoryService` and never placed on
+  `WorkerContext`.
+- Every worker (Recon, Knowledge, Report) receives `ctx.memory`. The Knowledge
+  Agent uses it for document search/index; Recon and Report can use the same
+  interface if they later need memory, but currently have no memory reads.
+- The orchestrator does not read memory today; because `Repositories` exposes no
+  memory stores, any future need must go through `MemoryService` as well.
+- MongoDB/Qdrant connection strings and clients are created at process boot and
+  are never passed to an executor.
 
 ## 4. Memory metadata schema
 
@@ -175,13 +218,14 @@ Enforcement points:
 Default deny applies at each layer: absent policy, denied policy, unknown scope,
 empty owner, unknown tenant, missing run binding or expired record all deny.
 
-**Alternate-path prevention:** raw memory repositories are not part of
-`Repositories`. They are constructed only in `src/api/main.ts` and
-`src/agents/boot.ts` and held privately by `MemoryService`. Agents receive
-`ctx.memory` (the service), so they cannot query the Mongo collection or a
-vector collection directly. The repository itself refuses unbounded queries
-(`assertIsolation`), so a future caller still cannot dump memory without an
-owner and scope.
+**Alternate-path prevention:** `Repositories` contains only operational stores.
+The memory repository, document repository and Qdrant knowledge store are
+constructed by `createMemoryStores` (called only in `src/api/main.ts` and
+`src/agents/boot.ts`) and held privately by `MemoryService`. Agents receive
+`ctx.memory` (the service), so `ctx.repos.documents` / `ctx.repos.knowledge` do
+not compile and no raw store is passed to an executor. The memory repository
+itself refuses unbounded queries (`assertIsolation`), so even a future caller
+cannot dump memory without an owner and scope.
 
 ## 6. Qdrant filtering changes
 
@@ -202,8 +246,9 @@ owner and scope.
 - Payload indexes on `owner_user_id` / `tenant_id` are created best-effort once
   per process. They are an optimization only: the filter is always sent, so a
   missing index cannot widen results.
-- Per-document authorization (`authorizeDocumentAccess`) remains in
-  `retrieveAuthorizedDocuments` and `/knowledge/search` as defense in depth.
+- Per-document authorization (`authorizeDocumentAccess`) remains inside
+  `MemoryService.searchDocuments` as defense in depth after the server-side
+  filter.
 
 Ingest now resolves `run_id` through the trusted run record, verifies the
 caller owns it, takes the tenant from the run, and stamps both owner and tenant
@@ -275,12 +320,14 @@ These are enforced in code, not by prompt text:
    tenant-bearing workload identities and to run-scoped memory whose tenant is
    derived from the trusted run record. Adding an IdP tenant claim is required
    for cross-user tenant sharing.
-4. **No agent task kind performs memory I/O today.** The service is wired into
-   every worker (`ctx.memory`), and the policy has run-bound `memory.read`/
-   `memory.write` rules, but no run token currently grants those actions.
-   Enabling agent memory requires an explicit change to `RUN_ACTIONS`/
-   `ACTIONS_BY_AUDIENCE` and the corresponding token exchange; it was not
-   enabled silently.
+4. **Durable memory-record I/O is not wired to an agent task yet.** Knowledge
+   document search/index does go through `MemoryService`, but the separate
+   durable memory records (`/memory`) are used only by the gateway today. The
+   service is wired into every worker (`ctx.memory`), and the policy has
+   run-bound `memory.read`/`memory.write` rules, but no run token currently
+   grants those actions. Enabling agent memory-record writes requires an
+   explicit change to `RUN_ACTIONS`/`ACTIONS_BY_AUDIENCE` and the corresponding
+   token exchange; it was not enabled silently.
 5. **Memory has no vector index.** Memory search is structured (owner, scope,
    key, substring, recency) over MongoDB. If semantic memory is added later, it
    must reuse the same closed filter pattern and server-side tenant/owner
@@ -294,12 +341,24 @@ These are enforced in code, not by prompt text:
 9. **Report/task context is not memory.** `tasks.output` and report content are
    operational artifacts. They are already treated as untrusted agent output by
    Phase 3, but they do not carry memory provenance/version metadata.
+10. **In-process service shares the worker process.** Option A centralizes all
+    memory *access paths*, but the worker process still holds the MongoDB/Qdrant
+    connection at boot. Database clients and connection strings are never passed
+    to an executor, and `ctx.repos` exposes no memory store; true credential
+    isolation would require a separate Memory Service process/deployment, which
+    is deferred (no Docker/Kubernetes changes in this phase).
 
 ## 10. Decisions and assumptions
 
 - **Memory is a new subsystem, not a new architecture.** It reuses MongoDB,
   the existing `AuthorizationProvider`, the existing audit interface and the
   Phase 3 detector; no new dependency, service or authz mechanism was added.
+- **The Memory Service is an in-process module (Option A).** It is not a
+  separate application service; this avoids new deployment/infrastructure work
+  while still centralizing all memory-owned Mongo/Qdrant access.
+- **Centralization is structural.** `Repositories` exposes only operational
+  stores; memory stores are created by `createMemoryStores` and held privately
+  by `MemoryService`. Agents receive `ctx.memory`.
 - **Collections are code-owned.** Source type determines the logical
   collection. This satisfies "only authorized collections can be queried"
   without exposing a collection parameter.

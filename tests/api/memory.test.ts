@@ -1,13 +1,13 @@
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../../src/api/app.js";
-import { createMemoryService } from "../../src/agents/memory.js";
 import { createLogger } from "../../src/core/logger.js";
 import type { FailClosedSecurityProviders } from "../../src/security/defaults.js";
 import {
   DenyAllAuthorizationProvider,
-  FakeMemoriesRepository,
+  FakeMemoryStores,
   FakeRepositories,
+  makeMemoryService,
   opaSecurity,
   testSecurity,
 } from "../helpers/testkit.js";
@@ -19,17 +19,12 @@ const bearer = "Bearer test-token";
 function makeApp(securityOverrides?: Partial<FailClosedSecurityProviders>, useOpa = false) {
   const security = useOpa ? opaSecurity(log, securityOverrides !== undefined ? { overrides: securityOverrides } : {}) : testSecurity(log, securityOverrides);
   const repos = new FakeRepositories();
-  const memoryRepo = new FakeMemoriesRepository();
-  const memory = createMemoryService({
-    repo: memoryRepo,
-    runs: repos.runs,
-    authz: security.authz,
-    audit: security.audit,
-  });
+  const stores = new FakeMemoryStores();
+  const memory = makeMemoryService(security, repos.runs, stores);
   return {
     app: createApp({ log, security, stores: {}, repos, memory }),
     repos,
-    memoryRepo,
+    stores,
   };
 }
 
@@ -52,7 +47,7 @@ async function writeUserMemory(
 
 describe("memory api", () => {
   it("stores memory with derived provenance, untrusted trust and a version", async () => {
-    const { app, memoryRepo } = makeApp();
+    const { app, stores } = makeApp();
 
     const res = await writeUserMemory(app);
     expect(res.status).toBe(201);
@@ -66,9 +61,9 @@ describe("memory api", () => {
     expect(typeof res.body.expires_at).toBe("string");
     expect(res.body.conflict).toBe(false);
 
-    expect(memoryRepo.records.length).toBe(1);
-    expect(memoryRepo.records[0]!.trust).toBe("untrusted");
-    expect(memoryRepo.records[0]!.authoritative).toBe(false);
+    expect(stores.memories.records.length).toBe(1);
+    expect(stores.memories.records[0]!.trust).toBe("untrusted");
+    expect(stores.memories.records[0]!.authoritative).toBe(false);
   });
 
   it("reads, searches, updates and deletes an owned memory", async () => {
@@ -211,7 +206,7 @@ describe("memory api", () => {
   });
 
   it("does not return another owner's memory", async () => {
-    const { app, memoryRepo } = makeApp();
+    const { app, stores } = makeApp();
     const now = new Date().toISOString();
     const foreign: MemoryRecord = {
       memoryId: "00000000-0000-7000-8000-000000000001",
@@ -230,7 +225,7 @@ describe("memory api", () => {
       tsCreated: now,
       tsUpdated: now,
     };
-    memoryRepo.records.push(foreign);
+    stores.memories.records.push(foreign);
 
     const read = await request(app).get(`/api/v1/memory/${foreign.memoryId}`).set("Authorization", bearer);
     expect(read.status).toBe(403);
@@ -241,7 +236,7 @@ describe("memory api", () => {
   });
 
   it("retains lineage and flags conflicts instead of silently overwriting", async () => {
-    const { app, memoryRepo } = makeApp();
+    const { app, stores } = makeApp();
     const first = await request(app)
       .post("/api/v1/memory")
       .set("Authorization", bearer)
@@ -266,7 +261,7 @@ describe("memory api", () => {
       .send({ source_type: "user", source_id: "u", scope: "user", key: "shared", content: "value two" });
     expect(third.status).toBe(201);
     expect(third.body.memory_id).toBe(second.body.memory_id);
-    expect(memoryRepo.records.length).toBe(2);
+    expect(stores.memories.records.length).toBe(2);
   });
 
   it("clamps retention to the source-type maximum", async () => {

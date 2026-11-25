@@ -2,7 +2,12 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../../src/api/app.js";
 import { createLogger } from "../../src/core/logger.js";
-import { FakeRepositories, testSecurity } from "../helpers/testkit.js";
+import {
+  FakeMemoryStores,
+  FakeRepositories,
+  makeMemoryService,
+  testSecurity,
+} from "../helpers/testkit.js";
 
 const log = createLogger("silent", false);
 const bearer = "Bearer test-token";
@@ -10,12 +15,14 @@ const bearer = "Bearer test-token";
 function makeApp() {
   const security = testSecurity(log);
   const repos = new FakeRepositories();
-  return { app: createApp({ log, security, stores: {}, repos }), repos };
+  const stores = new FakeMemoryStores();
+  const memory = makeMemoryService(security, repos.runs, stores);
+  return { app: createApp({ log, security, stores: {}, repos, memory }), repos, stores };
 }
 
 describe("knowledge api", () => {
   it("ingests a document and indexes it", async () => {
-    const { app, repos } = makeApp();
+    const { app, stores } = makeApp();
     const res = await request(app)
       .post("/api/v1/knowledge/documents")
       .set("Authorization", bearer)
@@ -25,9 +32,9 @@ describe("knowledge api", () => {
     expect(typeof res.body.doc_id).toBe("string");
     expect(res.body.chunk_count).toBeGreaterThan(0);
 
-    expect(repos.documents.documents.length).toBe(1);
-    expect(repos.documents.documents[0]!.status).toBe("indexed");
-    expect(repos.knowledge.chunks.length).toBe(1);
+    expect(stores.documents.documents.length).toBe(1);
+    expect(stores.documents.documents[0]!.status).toBe("indexed");
+    expect(stores.knowledge.chunks.length).toBe(1);
   });
 
   it("dedupes identical content", async () => {

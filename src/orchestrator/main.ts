@@ -16,7 +16,7 @@ async function start(): Promise<void> {
   const log = createLogger(config.LOG_LEVEL);
 
   const stores = await connectStores(config, log);
-  const repos = await createRepositories(stores.mongo!, stores.qdrant!);
+  const repos = await createRepositories(stores.mongo!);
   const security = buildSecurityProviders(config, log);
   const coordinator = createRedisCoordinator(stores.redis!);
 

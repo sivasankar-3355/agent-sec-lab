@@ -1,4 +1,5 @@
 import { AppError, AuthorizationDeniedError, NotFoundError, ValidationError } from "../core/errors.js";
+import { chunkText } from "../core/chunking.js";
 import { newId, stableHash } from "../core/ids.js";
 import {
   derivedMemoryTrust,
@@ -20,6 +21,7 @@ import {
 } from "../core/memory.js";
 import type { RunRecord } from "../core/domain.js";
 import type { RunsRepository } from "../db/repositories/contracts.js";
+import type { MemoryStores } from "../db/memory-store.js";
 import type {
   MemoryIsolation,
   MemoryUpdatePatch,
@@ -29,9 +31,11 @@ import type {
   AuditProvider,
   AuthorizationProvider,
   AuthzResource,
+  EmbeddingProvider,
 } from "../security/protocols.js";
 import { inspectUntrustedContent } from "../security/prompt/index.js";
 import type { DetectionResult, UntrustedTier } from "../security/prompt/types.js";
+import { authorizeDocumentAccess } from "./authz.js";
 
 /**
  * Verified caller identity for a memory operation.
@@ -51,6 +55,7 @@ export interface MemoryActor {
   agent?: string;
   workload?: string;
   approvedActions?: readonly string[];
+  approvedTargets?: readonly string[];
 }
 
 export interface WriteMemoryInput {
@@ -105,17 +110,70 @@ export interface MemorySearchResult {
   truncated: boolean;
 }
 
+export interface IngestDocumentInput {
+  source: string;
+  content: string;
+  contentType: string;
+  title?: string;
+  runId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface IngestDocumentResult {
+  docId: string;
+  chunkCount: number;
+  deduped: boolean;
+}
+
+export interface SearchDocumentsInput {
+  query: string;
+  limit?: number;
+}
+
+export interface DocumentProvenance {
+  source: string;
+  title: string;
+  contentHash: string;
+  ownerUserId?: string;
+  tenantId?: string;
+}
+
+/** Retrieved documents are always untrusted context with provenance. */
+export interface RetrievedDocumentMemory {
+  docId: string;
+  score: number;
+  trust: "untrusted";
+  provenance: DocumentProvenance;
+}
+
+export interface SearchDocumentsResult {
+  documents: readonly RetrievedDocumentMemory[];
+  denied: number;
+}
+
 export interface MemoryServiceDeps {
-  repo: MemoriesRepository;
+  /** Memory-owned persistence; never exposed to agents. */
+  stores: MemoryStores;
   runs: RunsRepository;
   authz: AuthorizationProvider;
   audit: AuditProvider;
+  embedding: EmbeddingProvider;
 }
+
+/** Upper bound on retrieved chunks; code-owned, never model-selected. */
+export const MAX_DOCUMENT_RETRIEVAL_LIMIT = 50;
+
+const DOCUMENT_METADATA_MAX_KEYS = 32;
+const DOCUMENT_METADATA_MAX_KEY_CHARS = 64;
+const DOCUMENT_METADATA_MAX_VALUE_CHARS = 1024;
+const RESERVED_DOCUMENT_METADATA_KEYS: ReadonlySet<string> = new Set(["trust", "provenance", "injection"]);
 
 type MemoryOperation = "read" | "write";
 
 interface AuthTarget {
   memoryId?: string;
+  /** Object id for document operations (knowledge:read/index, knowledge.search). */
+  requestedObject?: string;
   ownerUserId: string;
   tenantId?: string;
   runId?: string;
@@ -169,6 +227,30 @@ function normalizeKey(key: string | undefined): string | undefined {
 }
 
 /**
+ * Caller metadata is untrusted and namespaced away from authoritative fields.
+ * Only bounded scalar values survive; `trust`/`provenance`/`injection` are
+ * reserved for the service and can never be supplied.
+ */
+function sanitizeDocumentMetadata(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (metadata === undefined) return {};
+  const out: Record<string, unknown> = {};
+  let kept = 0;
+  for (const [key, value] of Object.entries(metadata)) {
+    if (kept >= DOCUMENT_METADATA_MAX_KEYS) break;
+    if (RESERVED_DOCUMENT_METADATA_KEYS.has(key)) continue;
+    if (key.length === 0 || key.length > DOCUMENT_METADATA_MAX_KEY_CHARS) continue;
+    if (typeof value === "string" && value.length <= DOCUMENT_METADATA_MAX_VALUE_CHARS) {
+      out[key] = value;
+      kept += 1;
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      out[key] = value;
+      kept += 1;
+    }
+  }
+  return out;
+}
+
+/**
  * The single application path for durable memory.
  *
  * Security properties:
@@ -184,16 +266,22 @@ function normalizeKey(key: string | undefined): string | undefined {
  * - TTLs are clamped per source type and query results exclude expired rows.
  */
 export class MemoryService {
-  private readonly repo: MemoriesRepository;
+  private readonly memories: MemoriesRepository;
+  private readonly documents: MemoryStores["documents"];
+  private readonly knowledge: MemoryStores["knowledge"];
   private readonly runs: RunsRepository;
   private readonly authz: AuthorizationProvider;
   private readonly audit: AuditProvider;
+  private readonly embedding: EmbeddingProvider;
 
   constructor(deps: MemoryServiceDeps) {
-    this.repo = deps.repo;
+    this.memories = deps.stores.memories;
+    this.documents = deps.stores.documents;
+    this.knowledge = deps.stores.knowledge;
     this.runs = deps.runs;
     this.authz = deps.authz;
     this.audit = deps.audit;
+    this.embedding = deps.embedding;
   }
 
   async write(actor: MemoryActor, input: WriteMemoryInput): Promise<MemoryRecord> {
@@ -228,7 +316,7 @@ export class MemoryService {
 
     const previousRaw =
       key !== undefined
-        ? await this.repo.findLatestByKey({
+        ? await this.memories.findLatestByKey({
             ownerUserId: resolved.ownerUserId,
             ...(resolved.tenantId !== undefined ? { tenantId: resolved.tenantId } : {}),
             scope,
@@ -297,14 +385,272 @@ export class MemoryService {
       record.tenantId,
     );
 
-    const stored = await this.repo.insert(record);
+    const stored = await this.memories.insert(record);
     await this.auditRecord("memory.write", actor, stored, { conflict: stored.conflict });
     return stored;
   }
 
+  /**
+   * Ingest a knowledge document. API-only: agents may index documents they can
+   * already access, but only the authenticated gateway admits new content.
+   */
+  async ingestDocument(actor: MemoryActor, input: IngestDocumentInput): Promise<IngestDocumentResult> {
+    this.assertActor(actor);
+    if (actor.kind !== "api") {
+      throw new AuthorizationDeniedError("document ingestion is only available to the authenticated API");
+    }
+    if (input.content.trim().length === 0) {
+      throw new ValidationError("document content cannot be empty");
+    }
+
+    let tenantId: string | undefined;
+    if (input.runId !== undefined) {
+      const run = await this.resolveRun(actor, input.runId);
+      tenantId = run.tenantId;
+    }
+
+    await this.authorizeAction(
+      actor,
+      "knowledge:write",
+      {
+        ownerUserId: actor.userId,
+        ...(tenantId !== undefined ? { tenantId } : {}),
+        ...(input.runId !== undefined ? { runId: input.runId } : {}),
+      },
+      tenantId ?? actor.tenantId,
+    );
+
+    const inspection = await inspectUntrustedContent(this.audit, {
+      tier: "external",
+      source: `knowledge.ingest:${input.source}`,
+      content: input.content,
+      agent: "gateway",
+      ...(input.runId !== undefined ? { runId: input.runId } : {}),
+      principal: actor.userId,
+    });
+
+    const contentHash = stableHash(input.content);
+    const existing = await this.documents.getByContentHash(contentHash);
+    if (existing !== null) {
+      // Do not disclose another owner's or tenant's doc id. The content itself
+      // is not returned and remains protected by per-document authorization.
+      const sameOwner = existing.ownerUserId === undefined || existing.ownerUserId === actor.userId;
+      const sameTenant = (existing.tenantId ?? "") === (tenantId ?? "");
+      return {
+        docId: sameOwner && sameTenant ? existing.docId : "",
+        chunkCount: existing.chunkCount,
+        deduped: true,
+      };
+    }
+
+    const chunks = chunkText(input.content);
+    const vectors = await this.embedding.embed(chunks.map((chunk) => chunk.text));
+    const docId = newId();
+    const title = input.title ?? input.source;
+    await this.knowledge.upsertChunks({
+      docId,
+      title,
+      source: input.source,
+      ...(input.runId !== undefined ? { runId: input.runId } : {}),
+      ownerUserId: actor.userId,
+      ...(tenantId !== undefined ? { tenantId } : {}),
+      chunks: chunks.map((chunk) => ({ index: chunk.index, contentHash: chunk.contentHash })),
+      vectors,
+    });
+
+    await this.documents.create({
+      docId,
+      source: input.source,
+      title,
+      contentType: input.contentType,
+      contentHash,
+      ...(input.runId !== undefined ? { runId: input.runId } : {}),
+      ownerUserId: actor.userId,
+      ...(tenantId !== undefined ? { tenantId } : {}),
+      metadata: {
+        ...sanitizeDocumentMetadata(input.metadata),
+        trust: "untrusted",
+        provenance: {
+          source: input.source,
+          ...(input.runId !== undefined ? { runId: input.runId } : {}),
+          ownerUserId: actor.userId,
+          ...(tenantId !== undefined ? { tenantId } : {}),
+        },
+        injection: injectionOf(inspection.result),
+      },
+    });
+    await this.documents.markIndexed(docId, chunks.length);
+
+    await this.audit.emit({
+      type: "knowledge.ingest",
+      ts: new Date().toISOString(),
+      traceId: docId,
+      principal: actor.userId,
+      ...(input.runId !== undefined ? { runId: input.runId } : {}),
+      data: {
+        doc_id: docId,
+        chunk_count: chunks.length,
+        source: input.source,
+        trust: "untrusted",
+        suspicious: inspection.result.suspicious,
+        ...(tenantId !== undefined ? { tenant_id: tenantId } : {}),
+      },
+    });
+
+    return { docId, chunkCount: chunks.length, deduped: false };
+  }
+
+  /**
+   * Secure RAG retrieval. The service selects the collection, applies the
+   * server-side owner/tenant filter, authorizes every candidate document with
+   * the existing policy, and returns untrusted data with provenance.
+   */
+  async searchDocuments(actor: MemoryActor, input: SearchDocumentsInput): Promise<SearchDocumentsResult> {
+    this.assertActor(actor);
+    const requested = input.limit ?? 10;
+    const limit = Math.min(Math.max(1, Math.trunc(requested)), MAX_DOCUMENT_RETRIEVAL_LIMIT);
+    const action = actor.kind === "api" ? "knowledge:read" : "knowledge.search";
+
+    await this.authorizeAction(
+      actor,
+      action,
+      {
+        ownerUserId: actor.userId,
+        ...(actor.tenantId !== undefined ? { tenantId: actor.tenantId } : {}),
+        ...(actor.runId !== undefined ? { runId: actor.runId } : {}),
+      },
+      actor.tenantId,
+    );
+
+    const inspection = await inspectUntrustedContent(this.audit, {
+      tier: "user-request",
+      source: "knowledge.query",
+      content: input.query,
+      agent: actor.agent ?? (actor.kind === "api" ? "gateway" : "knowledge"),
+      ...(actor.runId !== undefined ? { runId: actor.runId } : {}),
+      principal: actor.userId,
+    });
+
+    const vectors = await this.embedding.embed([input.query]);
+    const queryVector = vectors[0];
+    if (queryVector === undefined || queryVector.length === 0) {
+      await this.auditRetrieval(actor, inspection.result.suspicious, [], 0);
+      return { documents: [], denied: 0 };
+    }
+
+    const hits = await this.knowledge.search(queryVector, limit, {
+      ownerUserId: actor.userId,
+      includeUnowned: true,
+      ...(actor.tenantId !== undefined ? { tenantId: actor.tenantId } : {}),
+    });
+
+    const documents: RetrievedDocumentMemory[] = [];
+    let denied = 0;
+    for (const hit of hits) {
+      const doc = await this.documents.get(hit.docId);
+      if (doc === null) continue;
+      const allowed = await authorizeDocumentAccess({
+        authz: this.authz,
+        kind: actor.kind,
+        action,
+        user: actor.userId,
+        requestedObject: hit.docId,
+        resourceOwner: doc.ownerUserId ?? "",
+        resourceTenantId: doc.tenantId ?? "",
+        ...(actor.tenantId !== undefined ? { tenantId: actor.tenantId } : {}),
+        ...(actor.kind === "api" ? { scopes: actor.scopes } : {}),
+      });
+      if (!allowed) {
+        denied += 1;
+        continue;
+      }
+      documents.push({
+        docId: hit.docId,
+        score: hit.score,
+        trust: "untrusted",
+        provenance: {
+          source: doc.source,
+          title: doc.title,
+          contentHash: doc.contentHash,
+          ...(doc.ownerUserId !== undefined ? { ownerUserId: doc.ownerUserId } : {}),
+          ...(doc.tenantId !== undefined ? { tenantId: doc.tenantId } : {}),
+        },
+      });
+    }
+
+    await this.auditRetrieval(actor, inspection.result.suspicious, documents, denied);
+    return { documents, denied };
+  }
+
+  /**
+   * Mark explicit documents as indexed for an agent operation. Each document is
+   * independently authorized; unlike ingestion this does not admit new content.
+   */
+  async indexDocuments(actor: MemoryActor, docIds: readonly string[]): Promise<{ indexed: readonly string[] }> {
+    this.assertActor(actor);
+    if (actor.kind !== "operation") {
+      throw new AuthorizationDeniedError("document indexing is only available to an agent operation");
+    }
+    if (docIds.length === 0 || docIds.length > 100) {
+      throw new ValidationError("invalid document index request");
+    }
+
+    const indexed: string[] = [];
+    for (const docId of docIds) {
+      const doc = await this.documents.get(docId);
+      if (doc === null) continue;
+      await this.authorizeAction(
+        actor,
+        "knowledge.index",
+        {
+          requestedObject: docId,
+          ownerUserId: doc.ownerUserId ?? actor.userId,
+          ...(doc.tenantId !== undefined ? { tenantId: doc.tenantId } : {}),
+          ...(actor.runId !== undefined ? { runId: actor.runId } : {}),
+        },
+        actor.tenantId ?? doc.tenantId,
+      );
+      await this.documents.markIndexed(docId, doc.chunkCount);
+      indexed.push(docId);
+    }
+
+    await this.audit.emit({
+      type: "knowledge.index",
+      ts: new Date().toISOString(),
+      traceId: newId(),
+      principal: actor.userId,
+      ...(actor.runId !== undefined ? { runId: actor.runId } : {}),
+      data: { requested: docIds.length, indexed: indexed.length },
+    });
+    return { indexed };
+  }
+
+  private async auditRetrieval(
+    actor: MemoryActor,
+    querySuspicious: boolean,
+    documents: readonly RetrievedDocumentMemory[],
+    denied: number,
+  ): Promise<void> {
+    await this.audit.emit({
+      type: "knowledge.retrieval",
+      ts: new Date().toISOString(),
+      traceId: actor.runId ?? "knowledge-retrieval",
+      principal: actor.userId,
+      ...(actor.runId !== undefined ? { runId: actor.runId } : {}),
+      data: {
+        trust: "untrusted",
+        query_source: "knowledge.query",
+        query_suspicious: querySuspicious,
+        returned: documents.length,
+        denied,
+        doc_ids: documents.map((document) => document.docId),
+      },
+    });
+  }
+
   async get(actor: MemoryActor, memoryId: string): Promise<MemoryRecord> {
     this.assertActor(actor);
-    const record = await this.repo.get(memoryId);
+    const record = await this.memories.get(memoryId);
     if (record === null) throw new NotFoundError("memory not found");
     const tenant = await this.resolveRecordAccess(actor, record);
     await this.assertNotExpired(actor, record);
@@ -367,7 +713,7 @@ export class MemoryService {
 
     const q = input.q !== undefined ? input.q.slice(0, MEMORY_LIMITS.maxQueryChars) : undefined;
     const key = input.key !== undefined ? normalizeKey(input.key) : undefined;
-    const records = await this.repo.search({
+    const records = await this.memories.search({
       ownerUserId: actor.userId,
       ...(tenantId !== undefined ? { tenantId } : {}),
       scopes,
@@ -417,7 +763,7 @@ export class MemoryService {
 
   async update(actor: MemoryActor, memoryId: string, input: UpdateMemoryInput): Promise<MemoryRecord> {
     this.assertActor(actor);
-    const record = await this.repo.get(memoryId);
+    const record = await this.memories.get(memoryId);
     if (record === null) throw new NotFoundError("memory not found");
     const tenant = await this.resolveRecordAccess(actor, record);
     await this.assertNotExpired(actor, record);
@@ -472,11 +818,11 @@ export class MemoryService {
     };
 
     await this.authorize(actor, "write", this.targetOf(record), tenant);
-    const updated = await this.repo.update(memoryId, this.isolationOf(record), patch);
+    const updated = await this.memories.update(memoryId, this.isolationOf(record), patch);
     if (updated === null) {
       // The update filter pins the previous version, so a null result is
       // either concurrent modification or deletion. Distinguish the two.
-      const still = await this.repo.get(memoryId);
+      const still = await this.memories.get(memoryId);
       if (still === null) throw new NotFoundError("memory not found");
       throw new AppError("conflict", "memory was modified concurrently", 409);
     }
@@ -486,11 +832,11 @@ export class MemoryService {
 
   async remove(actor: MemoryActor, memoryId: string): Promise<boolean> {
     this.assertActor(actor);
-    const record = await this.repo.get(memoryId);
+    const record = await this.memories.get(memoryId);
     if (record === null) throw new NotFoundError("memory not found");
     const tenant = await this.resolveRecordAccess(actor, record);
     await this.authorize(actor, "write", this.targetOf(record), tenant);
-    const deleted = await this.repo.remove(memoryId, this.isolationOf(record));
+    const deleted = await this.memories.remove(memoryId, this.isolationOf(record));
     if (deleted) {
       await this.auditRecord("memory.delete", actor, record, {});
     }
@@ -500,6 +846,18 @@ export class MemoryService {
   private assertActor(actor: MemoryActor): void {
     if (actor.userId === "") {
       throw new AuthorizationDeniedError("memory access requires an authenticated user");
+    }
+  }
+
+  /**
+   * Operation callers must hold the action in the verified run grant. The OPA
+   * policy independently checks ownership/run/tenant; this is the least
+   * privilege check on the action itself.
+   */
+  private assertOperationGrant(actor: MemoryActor, action: string): void {
+    if (actor.kind !== "operation") return;
+    if (!(actor.approvedActions ?? []).includes(action)) {
+      throw new AuthorizationDeniedError(`operation '${action}' is not granted to this caller`);
     }
   }
 
@@ -635,7 +993,17 @@ export class MemoryService {
         : operation === "read"
           ? "memory.read"
           : "memory.write";
+    await this.authorizeAction(actor, action, target, effectiveTenantId);
+  }
 
+  /** Build and evaluate an OPA decision for any memory-owned action. */
+  private async authorizeAction(
+    actor: MemoryActor,
+    action: string,
+    target: AuthTarget,
+    effectiveTenantId?: string,
+  ): Promise<void> {
+    this.assertOperationGrant(actor, action);
     const resource: AuthzResource = {
       kind: actor.kind,
       ...(actor.kind === "api"
@@ -644,12 +1012,14 @@ export class MemoryService {
             workload: actor.workload ?? actor.agent ?? "",
             agent: actor.agent ?? "",
             runId: actor.runId ?? "",
+            approvedTargets: actor.approvedTargets ?? [],
             approvedActions: actor.approvedActions ?? [],
             requestedRunId: target.runId ?? actor.runId ?? "",
           }),
       user: actor.userId,
       requestedAction: action,
       ...(target.memoryId !== undefined ? { requestedObject: target.memoryId } : {}),
+      ...(target.requestedObject !== undefined ? { requestedObject: target.requestedObject } : {}),
       resourceOwner: target.ownerUserId,
       resourceTenantId: target.tenantId ?? "",
       ...(effectiveTenantId !== undefined ? { tenantId: effectiveTenantId } : {}),
@@ -657,7 +1027,7 @@ export class MemoryService {
 
     const decision = await this.authz.authorize(action, resource);
     if (!decision.allowed) {
-      throw new AuthorizationDeniedError(decision.reason ?? `memory operation '${action}' is not authorized`);
+      throw new AuthorizationDeniedError(decision.reason ?? `operation '${action}' is not authorized`);
     }
   }
 

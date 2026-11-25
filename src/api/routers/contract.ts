@@ -10,7 +10,7 @@ import type {
   EmbeddingProvider,
   RunTokenMinter,
 } from "../../security/protocols.js";
-import type { MemoryService } from "../../agents/memory.js";
+import type { MemoryActor, MemoryService } from "../../agents/memory.js";
 import { readPrincipal } from "../auth.js";
 
 export interface OrchestratorLink {
@@ -53,6 +53,17 @@ export function parseId(raw: string, label: string): string {
 
 export function readUserId(res: Response): string {
   return readPrincipal(res)?.userId ?? "";
+}
+
+/** Build the verified API memory actor from the authenticated principal. */
+export function readMemoryActor(res: Response): MemoryActor {
+  const principal = readPrincipal(res);
+  return {
+    kind: "api",
+    principal: principal?.principal ?? "",
+    userId: readUserId(res),
+    scopes: principal?.scopes ?? [],
+  };
 }
 
 export async function requireAuthorized(
