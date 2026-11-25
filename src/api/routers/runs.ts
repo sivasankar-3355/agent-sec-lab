@@ -79,10 +79,13 @@ export function createRunsRouter(deps: RouterDeps): Router {
 
   router.get("/runs/:runId", async (req, res) => {
     const runId = parseId(req.params.runId, "run");
-    await requireAuthorized(deps.authz, "runs:read", res, { runId });
-
     const run = await deps.repos.runs.get(runId);
     if (!run) throw new NotFoundError("run not found");
+    await requireAuthorized(deps.authz, "runs:read", res, {
+      runId,
+      ...(run.userId !== undefined ? { resourceOwner: run.userId } : {}),
+      ...(run.tenantId !== undefined ? { resourceTenantId: run.tenantId } : {}),
+    });
 
     const tasks = await deps.repos.tasks.listByRun(runId);
     const taskSummary = {
@@ -103,10 +106,13 @@ export function createRunsRouter(deps: RouterDeps): Router {
 
   router.get("/runs/:runId/findings", async (req, res) => {
     const runId = parseId(req.params.runId, "run");
-    await requireAuthorized(deps.authz, "runs:read", res, { runId });
-
     const run = await deps.repos.runs.get(runId);
     if (!run) throw new NotFoundError("run not found");
+    await requireAuthorized(deps.authz, "runs:read", res, {
+      runId,
+      ...(run.userId !== undefined ? { resourceOwner: run.userId } : {}),
+      ...(run.tenantId !== undefined ? { resourceTenantId: run.tenantId } : {}),
+    });
 
     const severitySchema = z.enum(["info", "low", "medium", "high", "critical"]);
     const severity: FindingSeverity | undefined =

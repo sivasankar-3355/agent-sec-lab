@@ -6,11 +6,30 @@ export interface AuthzResource {
   user?: string;
   agent?: string;
   audience?: readonly string[];
+  /** Decision kind: which policy set applies (a2a / api / operation). */
+  kind?: "api" | "a2a" | "operation";
+  /** Calling workload identity ("orchestrator", "recon", "gateway", ...). */
+  workload?: string;
+  tenantId?: string;
+  /** Approved run attributes, from the verified (signed) context. */
+  approvedTargets?: readonly string[];
+  approvedActions?: readonly string[];
+  /** Requested (untrusted) intent, checked against approved attributes. */
+  requestedAction?: string;
+  requestedTarget?: string;
+  requestedRunId?: string;
+  requestedDocIds?: readonly string[];
+  requestedObject?: string;
+  /** Server-side resource attributes (trusted by the enforcing agent). */
+  resourceOwner?: string;
+  resourceTenantId?: string;
 }
 
 export interface Decision {
   allowed: boolean;
   reason?: string;
+  /** Policy rule that decided, when known. */
+  rule?: string;
 }
 
 export interface SandboxStep {

@@ -100,6 +100,14 @@ function bindAudienceContext(ctx: VerifiedContext, audienceName: string): Verifi
   return { ...ctx, agent: audienceName };
 }
 
+/** Calling workload identity derived from the verified actor/principal. */
+function workloadOf(principal: string, ctx?: VerifiedContext): string {
+  const caller = ctx?.caller ?? "";
+  if (caller.startsWith("workload:")) return caller.slice("workload:".length);
+  if (principal.startsWith("workload:")) return principal.slice("workload:".length);
+  return "";
+}
+
 export function createA2ARouter(handler: A2AHandler, deps: AgentServerDeps): Router {
   const router = Router();
   const audienceName =
@@ -208,25 +216,61 @@ export function createA2ARouter(handler: A2AHandler, deps: AgentServerDeps): Rou
     }
 
     const resource: { runId?: string; taskId?: string } = {};
+    const intent: {
+      requestedAction?: string;
+      requestedTarget?: string;
+      requestedRunId?: string;
+      requestedDocIds?: string[];
+    } = {};
     if (hasRunGrant) {
       resource.runId = parsedCtx.runId;
+      intent.requestedRunId = parsedCtx.runId;
     } else if (typeof params === "object" && params !== null) {
-      const task = (params as { task?: { runId?: string; taskId?: string } }).task;
+      const task = (params as { task?: { runId?: string; taskId?: string; kind?: string; input?: Record<string, unknown> } }).task;
       const idParam = (params as { id?: string }).id;
       if (task?.runId) resource.runId = task.runId;
       if (task?.taskId) resource.taskId = task.taskId;
       if (typeof idParam === "string") resource.taskId = idParam;
     }
 
+    // Untrusted call intent (from the request body) — the OPA policy bounds it
+    // against the approved attributes from the *verified* token context.
+    if (typeof params === "object" && params !== null) {
+      const task = (params as { task?: { kind?: string; runId?: string; input?: Record<string, unknown> } }).task;
+      if (task?.kind !== undefined && typeof task.kind === "string") intent.requestedAction = task.kind;
+      if (task?.runId !== undefined && typeof task.runId === "string") intent.requestedRunId = task.runId;
+      if (task?.input !== undefined && typeof task.input === "object" && task.input !== null) {
+        const input = task.input as Record<string, unknown>;
+        if (typeof input.target === "string") intent.requestedTarget = input.target;
+        if (Array.isArray(input.docIds)) intent.requestedDocIds = input.docIds.filter((d): d is string => typeof d === "string");
+      }
+      const message = (params as { message?: { runId?: string } }).message;
+      if (message?.runId !== undefined && typeof message.runId === "string") intent.requestedRunId = message.runId;
+    }
+
+    const workload = workloadOf(verdict.principal, parsedCtx);
+    const policyAgent =
+      deps.agent ??
+      (audienceName !== undefined && audienceName.startsWith("a2a:") ? audienceName.slice("a2a:".length) : (audienceName ?? ""));
+
     const decision = await deps.authz.authorize(`a2a:${method}`, {
+      kind: "a2a",
       ...(res.locals.principal
         ? { principal: res.locals.principal.principal, scopes: res.locals.principal.scopes }
         : {}),
+      ...(workload.length > 0 ? { workload } : {}),
       ...(parsedCtx !== undefined && parsedCtx.userId.length > 0 ? { user: parsedCtx.userId } : {}),
-      ...(parsedCtx !== undefined && parsedCtx.agent.length > 0 ? { agent: parsedCtx.agent } : {}),
+      ...(policyAgent.length > 0 ? { agent: policyAgent } : {}),
       ...(parsedCtx !== undefined && parsedCtx.audience.length > 0 ? { audience: parsedCtx.audience } : {}),
+      ...(parsedCtx !== undefined && parsedCtx.scopeTargets.length > 0 ? { approvedTargets: parsedCtx.scopeTargets } : {}),
+      ...(parsedCtx !== undefined && parsedCtx.permittedActions.length > 0 ? { approvedActions: parsedCtx.permittedActions } : {}),
+      ...(parsedCtx !== undefined && parsedCtx.tenantId !== undefined ? { tenantId: parsedCtx.tenantId } : {}),
       ...(resource.runId !== undefined ? { runId: resource.runId } : {}),
       ...(resource.taskId !== undefined ? { taskId: resource.taskId } : {}),
+      ...(intent.requestedAction !== undefined ? { requestedAction: intent.requestedAction } : {}),
+      ...(intent.requestedTarget !== undefined ? { requestedTarget: intent.requestedTarget } : {}),
+      ...(intent.requestedRunId !== undefined ? { requestedRunId: intent.requestedRunId } : {}),
+      ...(intent.requestedDocIds !== undefined ? { requestedDocIds: intent.requestedDocIds } : {}),
     });
     if (!decision.allowed) {
       await deps.audit.emit({

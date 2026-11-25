@@ -63,6 +63,7 @@ type MongoDoc = {
   source?: string;
   contentType?: string;
   contentHash?: string;
+  ownerUserId?: string;
   chunkCount?: number;
   metadata?: Record<string, unknown>;
 };
@@ -423,6 +424,8 @@ class MongoDocumentsRepository implements DocumentsRepository {
     contentType: string;
     contentHash: string;
     runId?: string;
+    ownerUserId?: string;
+    tenantId?: string;
     metadata: Record<string, unknown>;
   }): Promise<DocumentRecord> {
     const now = isoNow();
@@ -436,6 +439,8 @@ class MongoDocumentsRepository implements DocumentsRepository {
       chunkCount: 0,
       status: "pending",
       ...(input.runId !== undefined ? { runId: input.runId } : {}),
+      ...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}),
+      ...(input.tenantId !== undefined ? { tenantId: input.tenantId } : {}),
       metadata: input.metadata,
       tsCreated: now,
       tsUpdated: now,
@@ -450,6 +455,8 @@ class MongoDocumentsRepository implements DocumentsRepository {
 
   private toRecord(doc: MongoDoc): DocumentRecord {
     const runId = doc.runId as string | undefined;
+    const ownerUserId = doc.ownerUserId as string | undefined;
+    const tenantId = doc.tenantId as string | undefined;
     return {
       docId: doc.docId as string,
       source: doc.source as string,
@@ -459,6 +466,8 @@ class MongoDocumentsRepository implements DocumentsRepository {
       chunkCount: (doc.chunkCount ?? 0) as number,
       status: doc.status as DocumentRecord["status"],
       ...(runId !== undefined ? { runId } : {}),
+      ...(ownerUserId !== undefined ? { ownerUserId } : {}),
+      ...(tenantId !== undefined ? { tenantId } : {}),
       metadata: (doc.metadata ?? {}) as Record<string, unknown>,
       tsCreated: doc.tsCreated as string,
       tsUpdated: doc.tsUpdated as string,

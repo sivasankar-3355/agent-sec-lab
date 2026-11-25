@@ -112,6 +112,8 @@ export interface DocumentRecord {
   chunkCount: number;
   status: DocumentStatus;
   runId?: string;
+  ownerUserId?: string;
+  tenantId?: string;
   metadata: Record<string, unknown>;
   tsCreated: string;
   tsUpdated: string;

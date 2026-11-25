@@ -21,6 +21,13 @@ const envSchema = z.object({
   STS_URL: z.string().trim().default(""),
   STS_HOST: z.string().trim().min(1).default("127.0.0.1"),
   STS_PORT: z.coerce.number().int().positive().max(65535).default(3002),
+  // ---- Authorization policy engine (OPA) ----
+  // Remote OPA URL (e.g. http://opa:8181). Empty = embedded Rego engine used.
+  OPA_URL: z.string().trim().default(""),
+  // Directory holding versioned policy bundles (default: policies).
+  OPA_POLICY_DIR: z.string().trim().min(1).default("policies"),
+  // Policy bundle version directory (default: v1).
+  OPA_POLICY_VERSION: z.string().trim().min(1).default("v1"),
   // ---- User authentication (API gateway only, HS256) ----
   // Dedicated symmetric secret. Never shared with the STS or worker agents.
   USER_JWT_SECRET: z.string().trim().default(""),

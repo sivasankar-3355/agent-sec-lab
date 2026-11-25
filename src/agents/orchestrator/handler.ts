@@ -3,7 +3,7 @@ import { A2AError, AppError, NotFoundError } from "../../core/errors.js";
 import type { RunState, TaskRecord } from "../../core/domain.js";
 import type { Repositories } from "../../db/repositories/build.js";
 import { lockKeyFor, seenKeyFor, type Coordinator } from "../../db/coordinator.js";
-import type { AuditProvider, VerifiedContext } from "../../security/protocols.js";
+import type { AuditProvider, AuthorizationProvider, VerifiedContext } from "../../security/protocols.js";
 import { createAgentCard } from "../../a2a/agentCard.js";
 import type { A2AHandler, CallContext } from "../../a2a/handler.js";
 import {
@@ -24,6 +24,7 @@ import { phaseFor, planRun } from "./workflows.js";
 import { agentForKind, type ChildTaskBroker, type TokenExchanger } from "./broker.js";
 import { assertTransition } from "./state.js";
 import { a2aAudience } from "../../security/audience.js";
+import { assertAuthorized } from "../authz.js";
 
 export interface OrchestratorOptions {
   pollIntervalMs: number;
@@ -39,6 +40,8 @@ export interface OrchestratorDeps {
   coordinator: Coordinator;
   children: ChildTaskBroker;
   exchange?: TokenExchanger;
+  /** Authorization PEP: validates which agents/operations this orchestrator may invoke. */
+  authz?: AuthorizationProvider;
   options?: Partial<OrchestratorOptions>;
 }
 
@@ -63,9 +66,11 @@ export class OrchestratorHandler implements A2AHandler {
   private readonly coordinator: Coordinator;
   private readonly children: ChildTaskBroker;
   private readonly exchange: TokenExchanger | undefined;
+  private readonly authz: AuthorizationProvider | undefined;
   private readonly options: OrchestratorOptions;
   private readonly drives = new Map<string, Promise<void>>();
   private readonly runTokens = new Map<string, string>();
+  private readonly runGrants = new Map<string, VerifiedContext>();
 
   constructor(deps: OrchestratorDeps) {
     this.log = deps.log;
@@ -74,6 +79,7 @@ export class OrchestratorHandler implements A2AHandler {
     this.coordinator = deps.coordinator;
     this.children = deps.children;
     this.exchange = deps.exchange;
+    this.authz = deps.authz;
     this.options = { ...DEFAULT_OPTIONS, ...(deps.options ?? {}) };
   }
 
@@ -161,6 +167,9 @@ export class OrchestratorHandler implements A2AHandler {
 
     if (ctx?.token !== undefined && bound !== undefined && bound.runId !== "") {
       this.runTokens.set(task.runId, ctx.token);
+    }
+    if (bound !== undefined && bound.runId !== "") {
+      this.runGrants.set(task.runId, bound);
     }
 
     const drive = this.driveRun(task.runId, task.taskId);
@@ -251,6 +260,29 @@ export class OrchestratorHandler implements A2AHandler {
           this.exchange !== undefined && this.runTokens.has(runId)
             ? await this.childToken(runId, child.kind)
             : undefined;
+        if (this.authz !== undefined) {
+          // Orchestrator PEP: the central OPA decides whether this orchestrator
+          // may invoke this agent for this operation on this run.
+          const grant = this.runGrants.get(runId);
+          await assertAuthorized(this.authz, "a2a:tasks/send", {
+            kind: "a2a",
+            workload: "orchestrator",
+            agent: agentForKind(child.kind),
+            ...(grant !== undefined && grant.userId !== "" ? { user: grant.userId } : {}),
+            runId,
+            approvedTargets: run.scope.targets,
+            approvedActions: grant?.permittedActions ?? [],
+            requestedAction: child.kind,
+            requestedRunId: runId,
+            ...(child.kind === "recon.run" && typeof child.input.target === "string"
+              ? { requestedTarget: child.input.target }
+              : {}),
+            ...(child.kind === "knowledge.index" && Array.isArray(child.input.docIds)
+              ? { requestedDocIds: child.input.docIds as string[] }
+              : {}),
+            ...(grant !== undefined && grant.tenantId !== undefined ? { tenantId: grant.tenantId } : {}),
+          });
+        }
         const submitted = await this.children.submit(child, childToken);
         if (submitted.status === "failed" || submitted.status === "canceled") {
           await this.repos.tasks.setStatus(child.taskId, "FAILED", {
@@ -313,6 +345,7 @@ export class OrchestratorHandler implements A2AHandler {
       await this.coordinator.releaseLock(lockKeyFor(runId));
       this.drives.delete(runId);
       this.runTokens.delete(runId);
+      this.runGrants.delete(runId);
     }
   }
 

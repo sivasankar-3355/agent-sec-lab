@@ -26,6 +26,7 @@ import type { A2ATask, A2AStatus, TaskInit } from "../../src/a2a/schema.js";
 import { newId } from "../../src/core/ids.js";
 import type { Repositories } from "../../src/db/repositories/build.js";
 import type {
+  AuditEvent,
   AuthTokenProvider,
   AuthorizationProvider,
   CryptoProvider,
@@ -43,6 +44,8 @@ import { failClosedProviders, type FailClosedSecurityProviders } from "../../src
 import { JwtTokenService, JwtVerifier } from "../../src/security/jwt-issuer.js";
 import { UserAuthService } from "../../src/security/user-jwt.js";
 import { USER_SCOPES } from "../../src/security/audience.js";
+import { createOpaAuthorizationProvider } from "../../src/security/opa/provider.js";
+import { DEFAULT_POLICY_DIR, DEFAULT_POLICY_VERSION } from "../../src/security/opa/policies.js";
 
 import { generateKeyPairSync } from "node:crypto";
 
@@ -214,6 +217,49 @@ export function testSecurity(log: Logger, overrides?: Partial<FailClosedSecurity
     embedding: new TestEmbeddingProvider(),
     ...overrides,
   };
+}
+
+/** Captures audit events for assertions. */
+export class TestAuditProvider {
+  readonly events: AuditEvent[] = [];
+
+  async emit(event: AuditEvent): Promise<void> {
+    this.events.push(event);
+  }
+}
+
+/**
+ * Security providers wired to the real OPA authorization engine (embedded
+ * Rego bundle). Use for policy-aware tests; every other control stays its
+ * test double (allow-all policy/network/sandbox + working model/crypto).
+ */
+export function opaSecurity(
+  log: Logger,
+  options: {
+    policyDir?: string;
+    policyVersion?: string;
+    audit?: TestAuditProvider;
+    authn?: AuthTokenProvider;
+    overrides?: Partial<FailClosedSecurityProviders>;
+  } = {},
+): FailClosedSecurityProviders {
+  const audit = options.audit ?? new TestAuditProvider();
+  return testSecurity(log, {
+    audit,
+    policy: new TestPolicyProvider(),
+    network: new TestNetworkProvider(),
+    sandbox: new TestSandboxProvider(),
+    model: new TestModelProvider(),
+    crypto: new TestCryptoProvider(),
+    ...(options.authn !== undefined ? { authn: options.authn } : {}),
+    authz: createOpaAuthorizationProvider({
+      log,
+      audit,
+      policyDir: options.policyDir ?? DEFAULT_POLICY_DIR,
+      policyVersion: options.policyVersion ?? DEFAULT_POLICY_VERSION,
+    }),
+    ...(options.overrides ?? {}),
+  });
 }
 
 class FakeUsersRepository implements UsersRepository {
@@ -455,6 +501,8 @@ class FakeDocumentsRepository implements DocumentsRepository {
     contentType: string;
     contentHash: string;
     runId?: string;
+    ownerUserId?: string;
+    tenantId?: string;
     metadata: Record<string, unknown>;
   }): Promise<DocumentRecord> {
     const now = isoNow();
@@ -467,6 +515,8 @@ class FakeDocumentsRepository implements DocumentsRepository {
       chunkCount: 0,
       status: "pending",
       runId: input.runId,
+      ownerUserId: input.ownerUserId,
+      tenantId: input.tenantId,
       metadata: input.metadata,
       tsCreated: now,
       tsUpdated: now,

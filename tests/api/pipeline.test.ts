@@ -19,12 +19,8 @@ import {
   FakeRepositories,
   FakeCoordinator,
   makeTestIdentity,
-  TestCryptoProvider,
-  TestModelProvider,
-  TestNetworkProvider,
-  TestPolicyProvider,
-  TestSandboxProvider,
   TestSecretProvider,
+  opaSecurity,
   testSecurity,
 } from "../helpers/testkit.js";
 import type { FailClosedSecurityProviders } from "../../src/security/defaults.js";
@@ -41,18 +37,13 @@ const identity = makeTestIdentity();
 const BOOTSTRAP = "boot-secret-e2e";
 
 function gatewaySecurity(): FailClosedSecurityProviders {
-  return testSecurity(log, { userAuth: identity.userAuth });
+  // User auth (HS256) + real OPA authorization for the gateway API.
+  return opaSecurity(log, { authn: identity.verifier, overrides: { userAuth: identity.userAuth } });
 }
 
 function workerSecurity(): FailClosedSecurityProviders {
-  return testSecurity(log, {
-    authn: identity.verifier,
-    policy: new TestPolicyProvider(),
-    network: new TestNetworkProvider(),
-    sandbox: new TestSandboxProvider(),
-    model: new TestModelProvider(),
-    crypto: new TestCryptoProvider(),
-  });
+  // Real OPA authorization; every other control is a test double.
+  return opaSecurity(log, { authn: identity.verifier });
 }
 
 const apps = {
@@ -140,6 +131,7 @@ beforeAll(async () => {
   orchestrator = new OrchestratorHandler({
     log,
     audit: apps.orchestrator.audit,
+    authz: apps.orchestrator.authz,
     repos,
     coordinator,
     children: new AgentClientsBroker({

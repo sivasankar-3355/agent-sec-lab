@@ -1,6 +1,7 @@
 import { AppError, EgressDeniedError, PolicyViolationError } from "../../core/errors.js";
 import { newId, stableHash } from "../../core/ids.js";
 import type { WorkerContext, WorkerExecuteInput, WorkerExecutor } from "../base.js";
+import { assertAuthorized, workloadOfCaller } from "../authz.js";
 
 export const reconAcceptedKinds: readonly ["recon.run"] = ["recon.run"];
 
@@ -19,6 +20,23 @@ export class ReconExecutor implements WorkerExecutor {
           403,
         );
       }
+    }
+
+    if (task.authz !== undefined) {
+      // Independent agent PEP: the central OPA must confirm the target is
+      // inside the approved scope of the *signed* run grant.
+      await assertAuthorized(ctx.security.authz, "recon.run", {
+        kind: "operation",
+        workload: workloadOfCaller(task.authz.caller),
+        agent: "recon",
+        ...(task.authz.userId !== "" ? { user: task.authz.userId } : {}),
+        runId: task.runId,
+        approvedTargets: task.authz.scopeTargets,
+        approvedActions: task.authz.permittedActions,
+        requestedAction: "recon.run",
+        requestedTarget: target,
+        ...(task.authz.tenantId !== undefined ? { tenantId: task.authz.tenantId } : {}),
+      });
     }
 
     const rulesRef = typeof task.input.rulesRef === "string" && task.input.rulesRef.length > 0 ? task.input.rulesRef : undefined;

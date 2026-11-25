@@ -48,6 +48,7 @@ async function start(): Promise<void> {
   const handler = new OrchestratorHandler({
     log,
     audit: security.audit,
+    authz: security.authz,
     repos,
     coordinator,
     children: new AgentClientsBroker({

@@ -4,6 +4,7 @@ import type { Config } from "../core/config.js";
 import { failClosedProviders, type FailClosedSecurityProviders } from "./defaults.js";
 import { JwtTokenService, JwtVerifier, publicKeyFromPrivate } from "./jwt-issuer.js";
 import { UserAuthService } from "./user-jwt.js";
+import { createOpaAuthorizationProvider } from "./opa/provider.js";
 
 /** Resolve a PEM from inline text or a `file:`-prefixed path. */
 export function resolvePem(value: string): string | undefined {
@@ -70,6 +71,17 @@ export function buildSecurityProviders(config: Config, log: Logger): FailClosedS
 
   const providers: FailClosedSecurityProviders = { ...base };
   if (userAuth !== undefined) providers.userAuth = userAuth;
+
+  // Central authorization: OPA (embedded Rego engine by default, remote OPA
+  // when OPA_URL is set). Every process enforces the same policy, and any
+  // evaluation error fails closed to deny.
+  providers.authz = createOpaAuthorizationProvider({
+    log,
+    audit: providers.audit,
+    policyDir: config.OPA_POLICY_DIR,
+    policyVersion: config.OPA_POLICY_VERSION,
+    opaUrl: config.OPA_URL,
+  });
 
   if (publicKeys.size > 0) {
     const options = {

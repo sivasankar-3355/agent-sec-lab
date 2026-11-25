@@ -89,6 +89,8 @@ export interface DocumentsRepository {
     contentType: string;
     contentHash: string;
     runId?: string;
+    ownerUserId?: string;
+    tenantId?: string;
     metadata: Record<string, unknown>;
   }): Promise<DocumentRecord>;
   markIndexed(docId: string, chunkCount: number): Promise<void>;

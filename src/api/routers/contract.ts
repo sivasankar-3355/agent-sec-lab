@@ -57,7 +57,9 @@ export async function requireAuthorized(
 ): Promise<void> {
   const principal = readPrincipal(res);
   const decision = await authz.authorize(action, {
+    kind: "api",
     ...(principal ? { principal: principal.principal, scopes: principal.scopes } : {}),
+    ...(principal !== undefined && principal.userId !== undefined ? { user: principal.userId } : {}),
     ...resource,
   });
   if (!decision.allowed) {

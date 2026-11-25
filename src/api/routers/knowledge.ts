@@ -4,7 +4,9 @@ import { chunkText } from "../../core/chunking.js";
 import { stableHash } from "../../core/ids.js";
 import { newId } from "../../core/ids.js";
 import type { RouterDeps } from "./contract.js";
-import { parseBody, requireAuthorized } from "./contract.js";
+import { parseBody, readUserId, requireAuthorized } from "./contract.js";
+import { readPrincipal } from "../auth.js";
+import { authorizeDocumentAccess } from "../../agents/authz.js";
 
 const ingestSchema = z
   .object({
@@ -28,6 +30,7 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
   router.post("/knowledge/documents", async (req, res) => {
     await requireAuthorized(deps.authz, "knowledge:write", res);
     const body = parseBody(ingestSchema, req.body);
+    const userId = readUserId(res);
 
     const contentHash = stableHash(body.content);
     const existing = await deps.repos.documents.getByContentHash(contentHash);
@@ -56,6 +59,7 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
       contentType: body.content_type,
       contentHash,
       ...(body.run_id ? { runId: body.run_id } : {}),
+      ...(userId.length > 0 ? { ownerUserId: userId } : {}),
       metadata: body.metadata ?? {},
     });
     await deps.repos.documents.markIndexed(docId, chunks.length);
@@ -71,9 +75,29 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
     const embedded = await deps.embedding.embed([query.q]);
     const hits = await deps.repos.knowledge.search(embedded[0]!, query.limit);
 
-    res.status(200).json({
-      hits: hits.map((hit) => ({ doc_id: hit.docId, score: hit.score, snippet: null })),
-    });
+    // ABAC: only return documents the user owns (or global knowledge), so an
+    // authenticated user cannot read another user's documents.
+    const principal = readPrincipal(res);
+    const userId = readUserId(res);
+    const visible: Array<{ doc_id: string; score: number; snippet: null }> = [];
+    for (const hit of hits) {
+      const doc = await deps.repos.documents.get(hit.docId);
+      if (!doc) continue;
+      const allowed = await authorizeDocumentAccess({
+        authz: deps.authz,
+        kind: "api",
+        action: "knowledge:read",
+        user: userId,
+        requestedObject: hit.docId,
+        resourceOwner: doc.ownerUserId ?? "",
+        resourceTenantId: doc.tenantId ?? "",
+        scopes: principal?.scopes ?? [],
+      });
+      if (!allowed) continue;
+      visible.push({ doc_id: hit.docId, score: hit.score, snippet: null });
+    }
+
+    res.status(200).json({ hits: visible });
   });
 
   return router;
