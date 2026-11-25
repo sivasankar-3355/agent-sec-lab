@@ -137,8 +137,14 @@ export function createSTSRouter(deps: STSDeps): Router {
     if (!runVerdict.valid || runVerdict.context === undefined || runVerdict.context.runId === "") {
       throw new AppError("forbidden", "invalid run token presented for exchange", 403);
     }
-    if (runVerdict.context.permittedActions.some((action) => !RUN_ACTIONS.includes(action))) {
+    const grantedActions = runVerdict.context.permittedActions;
+    if (grantedActions.some((action) => !RUN_ACTIONS.includes(action))) {
       throw new AppError("forbidden", "run token carries actions beyond the run grant", 403);
+    }
+    // The orchestrator can never widen its own grant: every child action must
+    // already be present in the presented run token's permitted actions.
+    if (actions.some((action) => !grantedActions.includes(action))) {
+      throw new AppError("forbidden", "requested child actions exceed the run token grant", 403);
     }
     const run = await deps.repos.runs.get(runVerdict.context.runId);
     if (!run) throw new AppError("not_found", "run not found", 404);

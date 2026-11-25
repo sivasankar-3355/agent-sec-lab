@@ -205,6 +205,25 @@ describe("STS token-exchange (orchestrator delegation)", () => {
     expect(res.status).toBe(403);
   });
 
+  it("rejects child actions outside the run token grant (no privilege widening)", async () => {
+    const { app, repos } = stsApp();
+    const run = await createRun(repos);
+    // A narrowed run grant: only recon.run was approved for this run.
+    const runToken = await identity.issuer.mintRunToken({
+      userId: "user:alice",
+      runId: run.runId,
+      targets: ["good.test"],
+      actions: ["recon.run"],
+      correlationId: "cid",
+    });
+    const workloadToken = await identity.workloadToken("orchestrator", [INTERNAL_EXCHANGE_SCOPE]);
+    const res = await request(app)
+      .post("/api/v1/internal/token-exchange")
+      .set("Authorization", `Bearer ${workloadToken}`)
+      .send({ runToken, audience: "a2a:report", actions: ["report.generate"] });
+    expect(res.status).toBe(403);
+  });
+
   it("rejects exchange for an unknown run", async () => {
     const { app } = stsApp();
     const runToken = await mintRunToken("0195aabb-ccdd-eeff-0011-223344556677");
