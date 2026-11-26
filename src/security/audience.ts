@@ -26,8 +26,11 @@ export const USER_SCOPES: readonly string[] = [
   "runs:read",
   "knowledge:read",
   "knowledge:write",
+  "memory:search",
   "memory:read",
-  "memory:write",
+  "memory:insert",
+  "memory:update",
+  "memory:delete",
 ];
 
 /** Which child audiences an orchestrator may exchange run credits for. */

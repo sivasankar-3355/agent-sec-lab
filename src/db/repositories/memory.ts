@@ -68,6 +68,8 @@ type MongoMemoryDoc = {
   memoryId: string;
   scope: string;
   collection: string;
+  memoryType: string;
+  status: string;
   key?: string;
   content: string;
   contentHash: string;
@@ -168,6 +170,8 @@ class MongoMemoriesRepository implements MemoriesRepository {
       memoryId: record.memoryId,
       scope: record.scope,
       collection: record.collection,
+      memoryType: record.memoryType,
+      status: record.status,
       ...(record.key !== undefined ? { key: record.key } : {}),
       content: record.content,
       contentHash: record.contentHash,
@@ -321,6 +325,8 @@ class MongoMemoriesRepository implements MemoriesRepository {
       memoryId: doc.memoryId,
       scope: doc.scope as MemoryScope,
       collection: doc.collection,
+      memoryType: doc.memoryType as MemoryRecord["memoryType"],
+      status: doc.status as MemoryRecord["status"],
       ...(key !== undefined ? { key } : {}),
       content: doc.content,
       contentHash: doc.contentHash,

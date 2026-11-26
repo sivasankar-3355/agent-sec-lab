@@ -9,6 +9,8 @@ import {
   MEMORY_LIMITS,
   memoryCollectionFor,
   memorySnippet,
+  memoryStatusFor,
+  memoryTypeFor,
   redactSensitiveMemoryContent,
   retentionSecondsFor,
   type MemoryInjectionSummary,
@@ -16,7 +18,9 @@ import {
   type MemoryProvenance,
   type MemoryRecord,
   type MemoryScope,
+  type MemoryStatus,
   type MemoryTrust,
+  type MemoryType,
   type WritableMemorySource,
 } from "../core/memory.js";
 import type { RunRecord } from "../core/domain.js";
@@ -91,6 +95,8 @@ export interface MemorySearchView {
   memoryId: string;
   scope: MemoryScope;
   collection: string;
+  memoryType: MemoryType;
+  status: MemoryStatus;
   key?: string;
   content: string;
   truncated: boolean;
@@ -168,7 +174,44 @@ const DOCUMENT_METADATA_MAX_KEY_CHARS = 64;
 const DOCUMENT_METADATA_MAX_VALUE_CHARS = 1024;
 const RESERVED_DOCUMENT_METADATA_KEYS: ReadonlySet<string> = new Set(["trust", "provenance", "injection"]);
 
-type MemoryOperation = "read" | "write";
+const WRITE_MEMORY_KEYS: ReadonlySet<string> = new Set([
+  "content",
+  "sourceType",
+  "sourceId",
+  "scope",
+  "key",
+  "tags",
+  "runId",
+  "conversationId",
+  "ttlSeconds",
+]);
+const UPDATE_MEMORY_KEYS: ReadonlySet<string> = new Set([
+  "content",
+  "key",
+  "tags",
+  "ttlSeconds",
+  "expectedVersion",
+]);
+const SEARCH_MEMORY_KEYS: ReadonlySet<string> = new Set(["scope", "runId", "key", "q", "limit"]);
+const INGEST_DOCUMENT_KEYS: ReadonlySet<string> = new Set([
+  "source",
+  "content",
+  "contentType",
+  "title",
+  "runId",
+  "metadata",
+]);
+
+/** Reject unknown fields so a caller cannot smuggle security metadata. */
+function assertKnownKeys(input: object, allowed: ReadonlySet<string>, label: string): void {
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) {
+      throw new ValidationError(`unknown ${label} field '${key}'`);
+    }
+  }
+}
+
+type MemoryOperation = "search" | "read" | "insert" | "update" | "delete";
 
 interface AuthTarget {
   memoryId?: string;
@@ -286,6 +329,13 @@ export class MemoryService {
 
   async write(actor: MemoryActor, input: WriteMemoryInput): Promise<MemoryRecord> {
     this.assertActor(actor);
+    assertKnownKeys(input, WRITE_MEMORY_KEYS, "memory write");
+    if (typeof input.content !== "string" || typeof input.sourceId !== "string") {
+      throw new ValidationError("invalid memory content or source id");
+    }
+    if (input.tags !== undefined && !Array.isArray(input.tags)) {
+      throw new ValidationError("memory tags must be an array");
+    }
     if (!isWritableMemorySource(input.sourceType)) {
       throw new ValidationError("memory source type is not writable");
     }
@@ -336,10 +386,13 @@ export class MemoryService {
 
     const now = new Date().toISOString();
     const ttl = retentionSecondsFor(input.sourceType, input.ttlSeconds);
+    const conflict = previous !== null;
     const record: MemoryRecord = {
       memoryId: newId(),
       scope,
       collection,
+      memoryType: memoryTypeFor(input.sourceType),
+      status: memoryStatusFor(conflict),
       ...(key !== undefined ? { key } : {}),
       content,
       contentHash,
@@ -353,7 +406,7 @@ export class MemoryService {
       tags,
       // A different value under the same logical key is a conflict: retain the
       // lineage instead of silently overwriting the earlier memory.
-      conflict: previous !== null,
+      conflict,
       provenance: {
         sourceType: input.sourceType,
         sourceId: input.sourceId.slice(0, MEMORY_LIMITS.maxSourceIdChars),
@@ -376,7 +429,7 @@ export class MemoryService {
 
     await this.authorize(
       actor,
-      "write",
+      "insert",
       {
         ownerUserId: record.ownerUserId,
         ...(record.tenantId !== undefined ? { tenantId: record.tenantId } : {}),
@@ -396,6 +449,10 @@ export class MemoryService {
    */
   async ingestDocument(actor: MemoryActor, input: IngestDocumentInput): Promise<IngestDocumentResult> {
     this.assertActor(actor);
+    assertKnownKeys(input, INGEST_DOCUMENT_KEYS, "document ingest");
+    if (typeof input.content !== "string" || typeof input.source !== "string") {
+      throw new ValidationError("invalid document content or source");
+    }
     if (actor.kind !== "api") {
       throw new AuthorizationDeniedError("document ingestion is only available to the authenticated API");
     }
@@ -661,6 +718,7 @@ export class MemoryService {
 
   async search(actor: MemoryActor, input: SearchMemoryInput = {}): Promise<MemorySearchResult> {
     this.assertActor(actor);
+    assertKnownKeys(input, SEARCH_MEMORY_KEYS, "memory search");
     const requested = input.limit ?? MEMORY_LIMITS.defaultResults;
     const limit = Math.min(Math.max(1, Math.trunc(requested)), MEMORY_LIMITS.maxResults);
 
@@ -702,7 +760,7 @@ export class MemoryService {
 
     await this.authorize(
       actor,
-      "read",
+      "search",
       {
         ownerUserId: actor.userId,
         ...(tenantId !== undefined ? { tenantId } : {}),
@@ -763,6 +821,7 @@ export class MemoryService {
 
   async update(actor: MemoryActor, memoryId: string, input: UpdateMemoryInput): Promise<MemoryRecord> {
     this.assertActor(actor);
+    assertKnownKeys(input, UPDATE_MEMORY_KEYS, "memory update");
     const record = await this.memories.get(memoryId);
     if (record === null) throw new NotFoundError("memory not found");
     const tenant = await this.resolveRecordAccess(actor, record);
@@ -817,7 +876,7 @@ export class MemoryService {
       previousVersion: record.integrity.version,
     };
 
-    await this.authorize(actor, "write", this.targetOf(record), tenant);
+    await this.authorize(actor, "update", this.targetOf(record), tenant);
     const updated = await this.memories.update(memoryId, this.isolationOf(record), patch);
     if (updated === null) {
       // The update filter pins the previous version, so a null result is
@@ -835,7 +894,7 @@ export class MemoryService {
     const record = await this.memories.get(memoryId);
     if (record === null) throw new NotFoundError("memory not found");
     const tenant = await this.resolveRecordAccess(actor, record);
-    await this.authorize(actor, "write", this.targetOf(record), tenant);
+    await this.authorize(actor, "delete", this.targetOf(record), tenant);
     const deleted = await this.memories.remove(memoryId, this.isolationOf(record));
     if (deleted) {
       await this.auditRecord("memory.delete", actor, record, {});
@@ -985,14 +1044,7 @@ export class MemoryService {
     target: AuthTarget,
     effectiveTenantId?: string,
   ): Promise<void> {
-    const action =
-      actor.kind === "api"
-        ? operation === "read"
-          ? "memory:read"
-          : "memory:write"
-        : operation === "read"
-          ? "memory.read"
-          : "memory.write";
+    const action = actor.kind === "api" ? `memory:${operation}` : `memory.${operation}`;
     await this.authorizeAction(actor, action, target, effectiveTenantId);
   }
 
@@ -1056,6 +1108,8 @@ export class MemoryService {
       memoryId: record.memoryId,
       scope: record.scope,
       collection: record.collection,
+      memoryType: record.memoryType,
+      status: record.status,
       ...(record.key !== undefined ? { key: record.key } : {}),
       content: snippet.content,
       truncated: snippet.truncated,
@@ -1087,6 +1141,8 @@ export class MemoryService {
         memory_id: record.memoryId,
         scope: record.scope,
         collection: record.collection,
+        memory_type: record.memoryType,
+        status: record.status,
         source_type: record.provenance.sourceType,
         trust: record.trust,
         conflict: record.conflict,

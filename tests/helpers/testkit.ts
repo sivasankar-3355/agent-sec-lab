@@ -141,7 +141,17 @@ class TestAuthTokenProvider implements AuthTokenProvider {
       return {
         valid: true,
         principal: "tester",
-        scopes: ["runs:read", "runs:write", "knowledge:read", "knowledge:write", "memory:read", "memory:write"],
+        scopes: [
+          "runs:read",
+          "runs:write",
+          "knowledge:read",
+          "knowledge:write",
+          "memory:search",
+          "memory:read",
+          "memory:insert",
+          "memory:update",
+          "memory:delete",
+        ],
       };
     }
     return { valid: false, reason: "invalid token" };

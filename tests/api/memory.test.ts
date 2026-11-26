@@ -12,9 +12,23 @@ import {
   testSecurity,
 } from "../helpers/testkit.js";
 import type { MemoryRecord } from "../../src/core/memory.js";
+import type { AuthTokenProvider, TokenVerdict } from "../../src/security/protocols.js";
 
 const log = createLogger("silent", false);
 const bearer = "Bearer test-token";
+
+class ReadOnlyMemoryAuth implements AuthTokenProvider {
+  async createToken(): Promise<string> {
+    return "read-only-memory";
+  }
+
+  async verifyToken(token: string): Promise<TokenVerdict> {
+    if (token === "read-only-memory") {
+      return { valid: true, principal: "reader", scopes: ["memory:read", "memory:search"] };
+    }
+    return { valid: false, reason: "invalid token" };
+  }
+}
 
 function makeApp(securityOverrides?: Partial<FailClosedSecurityProviders>, useOpa = false) {
   const security = useOpa ? opaSecurity(log, securityOverrides !== undefined ? { overrides: securityOverrides } : {}) : testSecurity(log, securityOverrides);
@@ -53,8 +67,11 @@ describe("memory api", () => {
     expect(res.status).toBe(201);
     expect(typeof res.body.memory_id).toBe("string");
     expect(res.body.trust).toBe("untrusted");
+    expect(res.body.trust_level).toBe("untrusted");
     expect(res.body.authoritative).toBe(false);
     expect(res.body.collection).toBe("user-notes");
+    expect(res.body.memory_type).toBe("user-note");
+    expect(res.body.status).toBe("active");
     expect(res.body.owner_user_id).toBe("tester");
     expect(res.body.provenance).toMatchObject({ sourceType: "user", sourceId: "user:tester", createdBy: "tester" });
     expect(res.body.integrity.version).toBe(1);
@@ -212,6 +229,8 @@ describe("memory api", () => {
       memoryId: "00000000-0000-7000-8000-000000000001",
       scope: "user",
       collection: "user-notes",
+      memoryType: "user-note",
+      status: "active",
       content: "foreign memory",
       contentHash: "hash",
       trust: "untrusted",
@@ -252,6 +271,7 @@ describe("memory api", () => {
     expect(second.status).toBe(201);
     expect(second.body.memory_id).not.toBe(first.body.memory_id);
     expect(second.body.conflict).toBe(true);
+    expect(second.body.status).toBe("conflicted");
     expect(second.body.integrity).toMatchObject({ version: 2, previousVersion: 1 });
 
     // Re-writing the same value is idempotent.
@@ -291,6 +311,24 @@ describe("memory api", () => {
       .set("Authorization", bearer)
       .send({ source_type: "user", source_id: "u", scope: "user", content: "blocked" });
     expect(res.status).toBe(403);
+  });
+
+  it("enforces separate memory permissions with default deny", async () => {
+    const security = opaSecurity(log, { authn: new ReadOnlyMemoryAuth() });
+    const repos = new FakeRepositories();
+    const stores = new FakeMemoryStores();
+    const memory = makeMemoryService(security, repos.runs, stores);
+    const app = createApp({ log, security, stores: {}, repos, memory });
+
+    const insert = await request(app)
+      .post("/api/v1/memory")
+      .set("Authorization", "Bearer read-only-memory")
+      .send({ source_type: "user", source_id: "u", scope: "user", content: "blocked" });
+    expect(insert.status).toBe(403);
+
+    const search = await request(app).get("/api/v1/memory").set("Authorization", "Bearer read-only-memory");
+    expect(search.status).toBe(200);
+    expect(search.body.memories).toEqual([]);
   });
 
   it("enforces the same memory rules with the real OPA policy", async () => {

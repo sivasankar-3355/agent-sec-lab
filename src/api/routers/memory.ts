@@ -83,8 +83,11 @@ function metadata(record: MemoryRecord): Record<string, unknown> {
     memory_id: record.memoryId,
     scope: record.scope,
     collection: record.collection,
+    memory_type: record.memoryType,
+    status: record.status,
     ...(record.key !== undefined ? { key: record.key } : {}),
     trust: record.trust,
+    trust_level: record.trust,
     authoritative: record.authoritative,
     conflict: record.conflict,
     owner_user_id: record.ownerUserId,
@@ -106,10 +109,13 @@ function searchView(view: MemorySearchView): Record<string, unknown> {
     memory_id: view.memoryId,
     scope: view.scope,
     collection: view.collection,
+    memory_type: view.memoryType,
+    status: view.status,
     ...(view.key !== undefined ? { key: view.key } : {}),
     content: view.content,
     truncated: view.truncated,
     trust: view.trust,
+    trust_level: view.trust,
     authoritative: view.authoritative,
     conflict: view.conflict,
     provenance: view.provenance,
@@ -126,7 +132,7 @@ export function createMemoryRouter(deps: RouterDeps): Router {
 
   router.post("/memory", async (req, res) => {
     const userId = readUserId(res);
-    await requireAuthorized(deps.authz, "memory:write", res, { resourceOwner: userId });
+    await requireAuthorized(deps.authz, "memory:insert", res, { resourceOwner: userId });
     const body = parseBody(writeSchema, req.body);
     const record = await serviceOf(deps).write(readMemoryActor(res), {
       content: body.content,
@@ -144,7 +150,7 @@ export function createMemoryRouter(deps: RouterDeps): Router {
 
   router.get("/memory", async (req, res) => {
     const userId = readUserId(res);
-    await requireAuthorized(deps.authz, "memory:read", res, { resourceOwner: userId });
+    await requireAuthorized(deps.authz, "memory:search", res, { resourceOwner: userId });
     const query = parseBody(searchSchema, req.query);
     const result = await serviceOf(deps).search(readMemoryActor(res), {
       ...(query.scope !== undefined ? { scope: query.scope } : {}),
@@ -167,7 +173,7 @@ export function createMemoryRouter(deps: RouterDeps): Router {
   router.patch("/memory/:memoryId", async (req, res) => {
     const userId = readUserId(res);
     const memoryId = parseId(req.params.memoryId, "memory");
-    await requireAuthorized(deps.authz, "memory:write", res, { resourceOwner: userId });
+    await requireAuthorized(deps.authz, "memory:update", res, { resourceOwner: userId });
     const body = parseBody(updateSchema, req.body);
     const record = await serviceOf(deps).update(readMemoryActor(res), memoryId, {
       ...(body.content !== undefined ? { content: body.content } : {}),
@@ -182,7 +188,7 @@ export function createMemoryRouter(deps: RouterDeps): Router {
   router.delete("/memory/:memoryId", async (req, res) => {
     const userId = readUserId(res);
     const memoryId = parseId(req.params.memoryId, "memory");
-    await requireAuthorized(deps.authz, "memory:write", res, { resourceOwner: userId });
+    await requireAuthorized(deps.authz, "memory:delete", res, { resourceOwner: userId });
     const deleted = await serviceOf(deps).remove(readMemoryActor(res), memoryId);
     res.status(200).json({ deleted });
   });

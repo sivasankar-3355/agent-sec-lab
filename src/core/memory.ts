@@ -39,6 +39,23 @@ export type MemoryScope = (typeof MEMORY_SCOPES)[number];
 
 export type MemoryTrust = "trusted" | "untrusted";
 
+/**
+ * Server-derived memory type. Callers cannot choose it; it is derived from the
+ * source that produced the content (and therefore from the admission path).
+ */
+export const MEMORY_TYPES = [
+  "user-note",
+  "document-context",
+  "tool-observation",
+  "agent-context",
+  "system",
+] as const;
+
+export type MemoryType = (typeof MEMORY_TYPES)[number];
+
+/** Lifecycle/conflict status. `expired` rows are removed by the TTL index. */
+export type MemoryStatus = "active" | "conflicted";
+
 /** Content-free detection summary stored alongside the memory. */
 export interface MemoryInjectionSummary {
   suspicious: boolean;
@@ -70,6 +87,10 @@ export interface MemoryRecord {
   scope: MemoryScope;
   /** Code-owned logical collection (derived from source type). */
   collection: string;
+  /** Server-derived memory type (derived from source type). */
+  memoryType: MemoryType;
+  /** Server-derived status (`conflicted` when a key collision occurred). */
+  status: MemoryStatus;
   /** Optional logical key used for conflict detection. */
   key?: string;
   content: string;
@@ -124,6 +145,13 @@ const COLLECTION_BY_SOURCE: Record<WritableMemorySource, string> = {
   agent_output: "agent-notes",
 };
 
+const MEMORY_TYPE_BY_SOURCE: Record<WritableMemorySource, MemoryType> = {
+  user: "user-note",
+  external_document: "document-context",
+  tool_output: "tool-observation",
+  agent_output: "agent-context",
+};
+
 const KNOWN_COLLECTIONS: ReadonlySet<string> = new Set(Object.values(COLLECTION_BY_SOURCE));
 
 export function isWritableMemorySource(value: string): value is WritableMemorySource {
@@ -138,6 +166,16 @@ export function memoryCollectionFor(sourceType: MemorySourceType): string {
 
 export function isKnownMemoryCollection(collection: string): boolean {
   return KNOWN_COLLECTIONS.has(collection);
+}
+
+/** Memory type is code-owned and derived; callers never choose it. */
+export function memoryTypeFor(sourceType: MemorySourceType): MemoryType {
+  if (!isWritableMemorySource(sourceType)) return "system";
+  return MEMORY_TYPE_BY_SOURCE[sourceType];
+}
+
+export function memoryStatusFor(conflict: boolean): MemoryStatus {
+  return conflict ? "conflicted" : "active";
 }
 
 /**

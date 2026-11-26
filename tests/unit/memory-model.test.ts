@@ -8,6 +8,8 @@ import {
   MEMORY_RETENTION_SECONDS,
   memoryCollectionFor,
   memorySnippet,
+  memoryStatusFor,
+  memoryTypeFor,
   retentionSecondsFor,
 } from "../../src/core/memory.js";
 
@@ -35,6 +37,16 @@ describe("memory model", () => {
     expect(memoryCollectionFor("tool_output")).toBe("tool-notes");
     expect(memoryCollectionFor("agent_output")).toBe("agent-notes");
     expect(memoryCollectionFor("system")).toBe("system");
+  });
+
+  it("derives a code-owned memory type and status", () => {
+    expect(memoryTypeFor("user")).toBe("user-note");
+    expect(memoryTypeFor("external_document")).toBe("document-context");
+    expect(memoryTypeFor("tool_output")).toBe("tool-observation");
+    expect(memoryTypeFor("agent_output")).toBe("agent-context");
+    expect(memoryTypeFor("system")).toBe("system");
+    expect(memoryStatusFor(false)).toBe("active");
+    expect(memoryStatusFor(true)).toBe("conflicted");
   });
 
   it("clamps requested retention to the source-type maximum", () => {

@@ -32,11 +32,11 @@ report_actions := {"report.generate"}
 api_scopes := {"runs:create", "runs:read", "knowledge:write", "knowledge:read"}
 
 # ---------------------------------------------------------------- Memory -----
-# Memory is durable, untrusted context. Read/write are separate scopes and are
-# never covered by the generic API rule above: a memory record must have a
-# non-empty owner that matches the user (no "unowned means public" shortcut).
-memory_api_scopes := {"memory:read", "memory:write"}
-memory_actions := {"memory.read", "memory.write"}
+# Memory is durable, untrusted context. Each operation has a separate scope
+# and is never covered by the generic API rule above: a memory record must have
+# a non-empty owner that matches the user (no "unowned means public" shortcut).
+memory_api_scopes := {"memory:search", "memory:read", "memory:insert", "memory:update", "memory:delete"}
+memory_actions := {"memory.search", "memory.read", "memory.insert", "memory.update", "memory.delete"}
 
 # ---------- A2A: discovery methods (any authenticated workload) ----------
 allow if {

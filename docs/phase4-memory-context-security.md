@@ -69,7 +69,7 @@ content stores were `documents` (Mongo) + the `knowledge` vector collection
 | File | Purpose |
 |---|---|
 | `policies/v1/authz.rego` | Memory API/operation rules, strict `memory_owned` (empty owner is never public), memory tenant matching; memory scopes excluded from the generic API rule |
-| `src/security/audience.ts` | Adds `memory:read` / `memory:write` to default user scopes |
+| `src/security/audience.ts` | Adds one of `memory:search`, `memory:read`, `memory:insert`, `memory:update`, `memory:delete` to default user scopes |
 | `src/api/routers/contract.ts` | `RouterDeps.memory` + `readMemoryActor` helper |
 | `src/api/app.ts` | `AppDeps.memory` + registers the memory router |
 | `src/api/main.ts` | Builds `MemoryService` over `createMemoryStores` |
@@ -136,6 +136,8 @@ snake_case. Application memory is **always** `trust: "untrusted"` and
   "memoryId": "uuidv7",
   "scope": "user | tenant | run | agent",
   "collection": "user-notes | document-notes | tool-notes | agent-notes",
+  "memoryType": "user-note | document-context | tool-observation | agent-context | system",
+  "status": "active | conflicted",
   "key": "optional logical key",
   "content": "bounded content",
   "contentHash": "sha256",
@@ -174,10 +176,13 @@ Notes:
 - `sourceType: "system"` exists only so the vocabulary can classify system
   content. It is **not writable** through any API or agent path; system
   instructions remain code-owned in `src/agents/prompts.ts`.
-- `collection` is derived from `sourceType`; callers cannot choose it.
+- `collection` and `memoryType` are derived from `sourceType`; callers cannot
+  choose either.
+- `status` is server-derived (`conflicted` when a logical key collides) and
+  `trust` is always `untrusted` for application memory.
 - `ownerUserId`, `tenantId`, `runId`, `trust`, `authoritative`, `contentHash`,
-  `integrity` and `provenance` are all server-derived. Strict request schemas
-  reject unknown fields.
+  `integrity`, `status`, `memoryType` and `provenance` are all server-derived.
+  Strict request schemas reject unknown fields.
 - `expiresAtDate` exists in Mongo only to drive the TTL index; it is never
   returned.
 
@@ -187,18 +192,18 @@ Every memory operation passes through **two** checks, both using the existing
 `AuthorizationProvider` (OPA):
 
 1. **API scope gate** — `requireAuthorized` in `src/api/routers/memory.ts`
-   (`memory:read` / `memory:write`) with `resourceOwner = caller`.
+   (one of `memory:search`, `memory:read`, `memory:insert`, `memory:update`, `memory:delete`) with `resourceOwner = caller`.
 2. **Resource PEP** — `MemoryService.authorize` in `src/agents/memory.ts`, with
    the verified resource owner/tenant and the exact operation:
-   - API: `memory:read` / `memory:write` (`kind: "api"`), scope list from the
+   - API: one of `memory:search`, `memory:read`, `memory:insert`, `memory:update`, `memory:delete` (`kind: "api"`), scope list from the
      user JWT.
-   - Agents: `memory.read` / `memory.write` (`kind: "operation"`), requiring the
+   - Agents: the matching `memory.search` / `memory.read` / `memory.insert` / `memory.update` / `memory.delete` (`kind: "operation"`), requiring the
      action in the run token's `approvedActions`, `requestedRunId == runId`,
      `agent != ""`, owner match and tenant match.
 
 Policy rules (`policies/v1/authz.rego`):
 
-- `memory_api_scopes := {"memory:read", "memory:write"}` — deliberately **not**
+- `memory_api_scopes := {"memory:search", "memory:read", "memory:insert", "memory:update", "memory:delete"}` — deliberately **not**
   in `api_scopes`, so the generic `resource_owned` rule (which treats an empty
   owner as public) cannot authorize memory.
 - `memory_owned` requires a non-empty `resourceOwner` that equals the caller.
@@ -253,6 +258,25 @@ cannot dump memory without an owner and scope.
 Ingest now resolves `run_id` through the trusted run record, verifies the
 caller owns it, takes the tenant from the run, and stamps both owner and tenant
 on the document and vector payload.
+
+## 6.1 Remaining direct database access
+
+Memory and knowledge-document access is centralized. The following operational
+MongoDB access remains intentionally direct, through typed repositories, and
+does **not** expose memory/knowledge stores:
+
+| Process / agent | Repositories | Why |
+|---|---|---|
+| Recon Agent | `findings` | Persists validated security evidence. Findings are a separate collection, not trusted instructions and not memory. |
+| Report Agent | `runs`, `findings`, `reports` | Reads the run/finding context needed to render a report and stores the report artifact. |
+| Orchestrator | `runs`, `tasks` | Workflow state, idempotency and child-task bookkeeping. |
+| API gateway | `runs`, `tasks`, `findings`, `reports`, `users` | User-facing run/report/auth operations. |
+| STS | `runs` | Validates the trusted run record before minting/exchanging tokens. |
+
+None of these repositories is a memory or knowledge-document store; none
+accepts a caller-selected collection or unbounded query from an agent. The
+Memory Service owns `memories`, `documents` and the Qdrant `knowledge`
+collection exclusively.
 
 ## 7. Memory poisoning protections
 
@@ -369,8 +393,10 @@ These are enforced in code, not by prompt text:
   code-owned prompts.
 - **Default deny at three layers.** Route scope, OPA resource decision, and the
   repository's mandatory isolation predicate must all succeed.
-- **Scope mapping.** `memory:read` covers read/search; `memory:write` covers
-  insert/update/delete. Operation actions are `memory.read` / `memory.write`.
+- **Scope mapping.** Each operation has a separate scope: `memory:search`,
+  `memory:read`, `memory:insert`, `memory:update`, `memory:delete`. Operation
+  actions use the same names with a dot (`memory.search`, etc.). There is no
+  combined read/write scope.
 - **Tenant source of truth.** For run-scoped memory, tenant and owner come from
   the trusted `runs` record; for user memory, from the verified identity. No
   request body field can set them.
@@ -380,7 +406,7 @@ These are enforced in code, not by prompt text:
 ```
 pnpm typecheck   # pass
 pnpm lint        # pass
-pnpm test        # 145 tests, 20 files, pass
+pnpm test        # 147 tests, 20 files, pass
 pnpm build       # typecheck + emit
 ```
 
