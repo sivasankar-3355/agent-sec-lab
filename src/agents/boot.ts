@@ -8,6 +8,7 @@ import { createMemoryStores } from "../db/memory-store.js";
 import { createA2ARouter } from "../a2a/server.js";
 import { BaseWorkerHandler, type WorkerExecutor } from "./base.js";
 import { createMemoryService } from "./memory.js";
+import { createAgentToolBroker } from "./tooling.js";
 import type { AgentKind, TaskKind } from "../a2a/schema.js";
 import { a2aAudience } from "../security/audience.js";
 
@@ -29,6 +30,7 @@ export async function bootWorker(
     audit: security.audit,
     embedding: security.embedding,
   });
+  const tools = createAgentToolBroker(security, repos);
 
   const handler = new BaseWorkerHandler(
     agent,
@@ -39,6 +41,7 @@ export async function bootWorker(
       repos,
       security,
       memory,
+      tools,
     },
     acceptedKinds,
   );

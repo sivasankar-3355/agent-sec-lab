@@ -1,28 +1,14 @@
 import { AppError, NotConfiguredError } from "../../core/errors.js";
-import type { AuthzResource } from "../../security/protocols.js";
 import type { WorkerContext, WorkerExecuteInput, WorkerExecutor } from "../base.js";
-import { assertAuthorized, workloadOfCaller } from "../authz.js";
+import { workloadOfCaller } from "../authz.js";
 import { knowledgeIndexTool, knowledgeSearchTool } from "../tools.js";
-import { validateToolCall } from "../../security/prompt/index.js";
+import { toolActorOf } from "../tool-actor.js";
 import type { MemoryActor, MemoryService } from "../memory.js";
 
 export const knowledgeAcceptedKinds: readonly ["knowledge.search", "knowledge.index"] = [
   "knowledge.search",
   "knowledge.index",
 ];
-
-function opBase(task: WorkerExecuteInput): AuthzResource {
-  return {
-    kind: "operation",
-    workload: workloadOfCaller(task.authz?.caller),
-    agent: "knowledge",
-    runId: task.runId,
-    approvedTargets: task.authz?.scopeTargets ?? [],
-    approvedActions: task.authz?.permittedActions ?? [],
-    ...(task.authz?.userId !== undefined && task.authz.userId !== "" ? { user: task.authz.userId } : {}),
-    ...(task.authz?.tenantId !== undefined ? { tenantId: task.authz.tenantId } : {}),
-  };
-}
 
 /** Build the memory actor from the verified run-token context only. */
 function actorOf(task: WorkerExecuteInput): MemoryActor {
@@ -55,54 +41,55 @@ export class KnowledgeExecutor implements WorkerExecutor {
   async execute(ctx: WorkerContext, task: WorkerExecuteInput): Promise<Record<string, unknown>> {
     switch (task.kind) {
       case "knowledge.search": {
-        const query = String(task.input.query);
-        const actor = actorOf(task);
+        const actor = toolActorOf("knowledge", task);
 
-        // Independent PEP for the tool gate. The Memory Service performs its
-        // own authorization for the retrieval; this decision only gates the
-        // tool call.
-        const authorization = await assertAuthorized(ctx.security.authz, "knowledge.search", {
-          ...opBase(task),
-          requestedAction: "knowledge.search",
-          requestedTarget: query,
-          ...(task.authz?.tenantId !== undefined ? { resourceTenantId: task.authz.tenantId } : {}),
-        });
-
-        const searchCall = validateToolCall(knowledgeSearchTool, { query }, {
-          ...(task.authz !== undefined ? { grant: task.authz } : {}),
-          decision: authorization,
-        });
-
-        // All Qdrant/Mongo document access happens inside the Memory Service:
-        // server-side owner/tenant filter, per-document authorization,
-        // provenance and untrusted tagging.
-        const retrieval = await memoryOf(ctx).searchDocuments(actor, {
-          query: searchCall.query,
-          limit: 10,
-        });
-
-        return {
-          hits: retrieval.documents.map((document) => ({
-            docId: document.docId,
-            score: document.score,
-            trust: document.trust,
-            provenance: document.provenance,
-          })),
-          denied: retrieval.denied,
-        };
-      }
-      case "knowledge.index": {
-        const actor = actorOf(task);
-        // Strict validation of the document set; the model never chooses which
-        // documents to index.
-        const indexCall = validateToolCall(
-          knowledgeIndexTool,
-          { docIds: (task.input.docIds as string[]) ?? [] },
-          { ...(task.authz !== undefined ? { grant: task.authz } : {}) },
+        // The Tool Broker enforces the knowledge.search allowlist, verified
+        // identity, run binding, strict query schema, OPA action grant and
+        // rate/timeout limits. All Qdrant/Mongo document access then happens
+        // inside the Memory Service with its own server-side owner/tenant
+        // filter and per-document authorization.
+        const result = await ctx.tools.execute(
+          knowledgeSearchTool,
+          actor,
+          { name: knowledgeSearchTool.name, args: { query: task.input.query } },
+          async (call) => {
+            const retrieval = await memoryOf(ctx).searchDocuments(actorOf(task), {
+              query: call.args.query,
+              limit: 10,
+            });
+            return {
+              hits: retrieval.documents.map((document) => ({
+                docId: document.docId,
+                score: document.score,
+                trust: document.trust,
+                provenance: document.provenance,
+              })),
+              denied: retrieval.denied,
+            };
+          },
+          { ...(task.signal !== undefined ? { signal: task.signal } : {}) },
         );
 
-        const { indexed } = await memoryOf(ctx).indexDocuments(actor, indexCall.docIds);
-        return { indexed: [...indexed] };
+        return result.data;
+      }
+      case "knowledge.index": {
+        const actor = toolActorOf("knowledge", task);
+
+        // The model never chooses which documents to index. Strict validation
+        // happens in the broker; per-document ownership and tenant checks
+        // happen inside the Memory Service.
+        const result = await ctx.tools.execute(
+          knowledgeIndexTool,
+          actor,
+          { name: knowledgeIndexTool.name, args: { docIds: task.input.docIds } },
+          async (call) => {
+            const { indexed } = await memoryOf(ctx).indexDocuments(actorOf(task), call.args.docIds);
+            return { indexed: [...indexed] };
+          },
+          { ...(task.signal !== undefined ? { signal: task.signal } : {}) },
+        );
+
+        return result.data;
       }
       default:
         throw new AppError("unsupported_task_kind", `knowledge worker does not accept '${task.kind}'`, 422);

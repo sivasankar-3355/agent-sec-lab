@@ -21,6 +21,7 @@ import {
   FakeMemoryStores,
   makeMemoryService,
   makeTestIdentity,
+  makeToolBroker,
   TestSecretProvider,
   opaSecurity,
   testSecurity,
@@ -96,6 +97,7 @@ const workerCtx = (security: FailClosedSecurityProviders) => ({
   repos,
   security,
   memory: makeMemoryService(security, repos.runs, memoryStores),
+  tools: makeToolBroker(security, repos),
 });
 
 beforeAll(async () => {

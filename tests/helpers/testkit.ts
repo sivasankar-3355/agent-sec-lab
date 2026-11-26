@@ -29,6 +29,12 @@ import type {
 import type { MemoryRecord } from "../../src/core/memory.js";
 import type { MemoryStores } from "../../src/db/memory-store.js";
 import { createMemoryService, type MemoryService } from "../../src/agents/memory.js";
+import { agentToolRegistry } from "../../src/agents/tools.js";
+import {
+  createToolBroker,
+  type TargetResolver,
+  type ToolBroker,
+} from "../../src/security/tools/index.js";
 import type { Coordinator } from "../../src/db/coordinator.js";
 import type { ChildTaskBroker } from "../../src/agents/orchestrator/broker.js";
 import type { A2ATask, A2AStatus, TaskInit } from "../../src/a2a/schema.js";
@@ -179,6 +185,18 @@ export class TestPolicyProvider implements PolicyProvider {
 export class TestNetworkProvider implements NetworkPolicyProvider {
   async assertEgress(_target: string): Promise<{ allowed: boolean; reason?: string }> {
     return { allowed: true };
+  }
+}
+
+/**
+ * Deterministic resolver for tests. Fake target names in the test suite resolve
+ * to a public documentation address so they pass the SSRF checks.
+ */
+export class TestTargetResolver implements TargetResolver {
+  constructor(private readonly addresses: readonly string[] = ["93.184.216.34"]) {}
+
+  async resolve(_hostname: string): Promise<readonly string[]> {
+    return [...this.addresses];
   }
 }
 
@@ -340,7 +358,11 @@ class FakeRunsRepository implements RunsRepository {
   }
 
   async get(runId: string): Promise<RunRecord | null> {
-    return this.records.get(runId);
+    return this.records.get(runId) ?? null;
+  }
+
+  seed(record: RunRecord): void {
+    this.records.set(record.runId, record);
   }
 
   async setState(runId: string, state: RunState, ts?: string): Promise<void> {
@@ -828,5 +850,21 @@ export function makeMemoryService(
     authz: security.authz,
     audit: security.audit,
     embedding: security.embedding,
+  });
+}
+
+/** Tool Broker wired to the production registry and test security providers. */
+export function makeToolBroker(
+  security: FailClosedSecurityProviders,
+  repos: FakeRepositories,
+  options: { resolver?: TargetResolver } = {},
+): ToolBroker {
+  return createToolBroker({
+    registry: agentToolRegistry,
+    authz: security.authz,
+    audit: security.audit,
+    network: security.network,
+    resolver: options.resolver ?? new TestTargetResolver(),
+    resolveRun: (runId) => repos.runs.get(runId),
   });
 }

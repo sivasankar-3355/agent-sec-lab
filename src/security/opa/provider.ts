@@ -64,6 +64,7 @@ export class OpaAuthorizationProvider implements AuthorizationProvider {
         policy: input.context.policy,
         kind: input.kind,
         action: attrs.action,
+        tool: attrs.requestedTool,
         workload: attrs.workload,
         agent: attrs.agent,
         user: attrs.user,

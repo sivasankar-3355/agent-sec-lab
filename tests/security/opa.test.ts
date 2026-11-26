@@ -77,6 +77,7 @@ describe("OPA policy engine + bundle", () => {
       runId: "run-1",
       requestedAction: "report.generate",
       requestedRunId: "run-1",
+      approvedActions: ["report.generate"],
       resourceOwner: "user:alice",
     };
     expect((await p.authorize("report.generate", report)).allowed).toBe(true);

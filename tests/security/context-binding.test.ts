@@ -15,6 +15,7 @@ import {
   FakeCoordinator,
   FakeRepositories,
   makeTestIdentity,
+  makeToolBroker,
   TestNetworkProvider,
   TestPolicyProvider,
   TestSandboxProvider,
@@ -57,10 +58,29 @@ async function runTokenFor(targets: string[], actions: string[]): Promise<string
 
 beforeAll(async () => {
   const security = withAuthn(identity.verifier);
+  const repos = new FakeRepositories();
+  const now = new Date().toISOString();
+  repos.runs.seed({
+    runId: "0195aabb-0000-7000-8000-000000000000",
+    name: "context-binding",
+    scope: { targets: ["good.test", "other.test"] },
+    userId: "user:alice",
+    config: {},
+    state: "CREATED",
+    timeline: [{ state: "CREATED", ts: now }],
+    tsCreated: now,
+    tsUpdated: now,
+  });
   recon = new BaseWorkerHandler(
     "recon",
     new ReconExecutor(),
-    { log, audit: security.audit, repos: new FakeRepositories(), security },
+    {
+      log,
+      audit: security.audit,
+      repos,
+      security,
+      tools: makeToolBroker(security, repos),
+    },
     reconAcceptedKinds,
   );
   const app = express();

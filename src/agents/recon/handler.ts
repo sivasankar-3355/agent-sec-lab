@@ -1,14 +1,13 @@
-import { AppError, EgressDeniedError, PolicyViolationError } from "../../core/errors.js";
+import { PolicyViolationError, ValidationError } from "../../core/errors.js";
 import { newId, stableHash } from "../../core/ids.js";
 import type { WorkerContext, WorkerExecuteInput, WorkerExecutor } from "../base.js";
-import { assertAuthorized, workloadOfCaller } from "../authz.js";
 import { agentDeveloperPrompt, agentSystemPrompt } from "../prompts.js";
 import { reconSnapshotTool } from "../tools.js";
+import { toolActorOf } from "../tool-actor.js";
 import {
   asDataText,
   assemblePrompt,
   auditPromptAssembly,
-  validateToolCall,
 } from "../../security/prompt/index.js";
 
 export const reconAcceptedKinds: readonly ["recon.run"] = ["recon.run"];
@@ -24,61 +23,57 @@ function toolOutputText(output: unknown): string {
 
 export class ReconExecutor implements WorkerExecutor {
   async execute(ctx: WorkerContext, task: WorkerExecuteInput): Promise<Record<string, unknown>> {
-    const target = String(task.input.target);
+    if (typeof task.input.target !== "string" || task.input.target.trim().length === 0) {
+      throw new ValidationError("recon target is required");
+    }
+    const target = task.input.target;
+    const actor = toolActorOf("recon", task);
 
-    if (task.authz !== undefined && task.authz.runId !== "") {
-      if (task.runId !== task.authz.runId) {
-        throw new AppError("forbidden", `recon run '${task.runId}' outside authorized run '${task.authz.runId}'`, 403);
-      }
-      if (!task.authz.scopeTargets.includes(target)) {
-        throw new AppError(
-          "forbidden",
-          `recon target '${target}' is outside the approved scope [${task.authz.scopeTargets.join(", ")}]`,
-          403,
+    // The Tool Broker is the only execution path. It verifies the registry
+    // allowlist, the verified identity, the trusted run record's scope, the
+    // signed grant, DNS/IP safety, the OPA decision and all execution limits.
+    // The handler below runs only after every gate has passed.
+    const snapshot = await ctx.tools.execute(
+      reconSnapshotTool,
+      actor,
+      { name: reconSnapshotTool.name, args: { target } },
+      async (call) => {
+        const rulesRef =
+          typeof task.input.rulesRef === "string" && task.input.rulesRef.length > 0
+            ? task.input.rulesRef
+            : undefined;
+        const approvedTarget = call.target?.canonical ?? target;
+
+        const violations = await ctx.security.policy.evaluate(
+          approvedTarget,
+          "recon.snapshot",
+          rulesRef === undefined ? [] : [rulesRef],
         );
-      }
-    }
+        if (violations.length > 0) {
+          throw new PolicyViolationError(violations.map((v) => `${v.rule}: ${v.reason}`).join("; "));
+        }
 
-    const authorization =
-      task.authz !== undefined
-        ? await assertAuthorized(ctx.security.authz, "recon.run", {
-            kind: "operation",
-            workload: workloadOfCaller(task.authz.caller),
-            agent: "recon",
-            ...(task.authz.userId !== "" ? { user: task.authz.userId } : {}),
-            runId: task.runId,
-            approvedTargets: task.authz.scopeTargets,
-            approvedActions: task.authz.permittedActions,
-            requestedAction: "recon.run",
-            requestedTarget: target,
-            ...(task.authz.tenantId !== undefined ? { tenantId: task.authz.tenantId } : {}),
-          })
-        : undefined;
+        // The sandbox receives the pinned, canonical target envelope. It must
+        // connect only to those addresses and must not follow redirects.
+        const step = await ctx.security.sandbox.run({
+          name: reconSnapshotTool.name,
+          input: call.args,
+          ...(call.target !== undefined ? { target: call.target } : {}),
+          constraints: { maxRedirects: 0, allowPrivate: false },
+        });
+        if (!step.ok) {
+          // Do not surface adapter output in the error: it is untrusted and
+          // may contain sensitive data. The broker audits only the failure.
+          throw new PolicyViolationError("recon sandbox step failed");
+        }
+        return step.output;
+      },
+      { ...(task.signal !== undefined ? { signal: task.signal } : {}) },
+    );
 
-    // Independent tool gate: the target is code-selected, but its arguments are
-    // still validated against a strict schema and the signed run grant before
-    // any sandbox step runs. Prompt content never participates in this call.
-    const snapshotCall = validateToolCall(reconSnapshotTool, { target }, {
-      ...(task.authz !== undefined ? { grant: task.authz } : {}),
-      ...(authorization !== undefined ? { decision: authorization } : {}),
-    });
-
-    const rulesRef = typeof task.input.rulesRef === "string" && task.input.rulesRef.length > 0 ? task.input.rulesRef : undefined;
-
-    const violations = await ctx.security.policy.evaluate(target, "recon.snapshot", rulesRef === undefined ? [] : [rulesRef]);
-    if (violations.length > 0) {
-      throw new PolicyViolationError(violations.map((v) => `${v.rule}: ${v.reason}`).join("; "));
-    }
-
-    const egress = await ctx.security.network.assertEgress(target);
-    if (!egress.allowed) {
-      throw new EgressDeniedError(egress.reason ?? `egress to '${target}' denied`);
-    }
-
-    const step = await ctx.security.sandbox.run({ name: reconSnapshotTool.name, input: snapshotCall });
-    if (!step.ok) {
-      throw new PolicyViolationError(`recon step failed: ${String(step.output)}`);
-    }
+    // The canonical, broker-validated target is the authoritative spelling for
+    // the prompt and the finding. The raw task value is only a fallback.
+    const approvedTarget = snapshot.provenance.target ?? target;
 
     // The target and the sandbox output are untrusted data. They are rendered
     // inside an attributed UNTRUSTED_DATA envelope, never into instructions.
@@ -88,11 +83,11 @@ export class ReconExecutor implements WorkerExecutor {
       developer: agentDeveloperPrompt("recon"),
       task: "Summarize the reconnaissance observations for the approved target.",
       untrusted: [
-        { tier: "user-request", source: "run.scope.target", content: target, maxChars: 2048 },
+        { tier: "user-request", source: "run.scope.target", content: approvedTarget, maxChars: 2048 },
         {
           tier: "tool-output",
-          source: `tool:${reconSnapshotTool.name}`,
-          content: toolOutputText(step.output),
+          source: `tool:${snapshot.tool}`,
+          content: toolOutputText(snapshot.data),
         },
       ],
     });
@@ -112,7 +107,7 @@ export class ReconExecutor implements WorkerExecutor {
       // model control not wired; reasoning is optional
     }
 
-    const hash = stableHash(`recon:${target}:${note}`);
+    const hash = stableHash(`recon:${approvedTarget}:${note}`);
     const existing = await ctx.repos.findings.getByHash(hash);
     const findingId = existing?.findingId ?? newId();
     if (!existing) {
@@ -122,9 +117,17 @@ export class ReconExecutor implements WorkerExecutor {
         taskId: task.taskId,
         agent: "recon",
         severity: "medium",
-        title: `recon snapshot of ${target}`,
-        description: note.length > 0 ? note : `recon snapshot completed for ${target}`,
-        refs: [],
+        title: `recon snapshot of ${approvedTarget}`,
+        description: note.length > 0 ? note : `recon snapshot completed for ${approvedTarget}`,
+        // Provenance only; the raw sandbox output is not persisted here.
+        evidence: {
+          tool: snapshot.tool,
+          trust: snapshot.trust,
+          authoritative: snapshot.authoritative,
+          ...(snapshot.provenance.target !== undefined ? { target: snapshot.provenance.target } : {}),
+          bytes: snapshot.bytes,
+        },
+        refs: [`tool:${snapshot.tool}`],
         tags: ["recon"],
         status: "open",
         hash,

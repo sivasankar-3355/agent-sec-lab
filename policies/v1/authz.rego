@@ -6,7 +6,7 @@
 #     "attributes": {
 #       "action", "workload", "agent", "user", "runId",
 #       "approvedTargets", "approvedActions",
-#       "requestedAction", "requestedTarget", "requestedRunId",
+#       "requestedAction", "requestedTool", "requestedTarget", "requestedRunId",
 #       "requestedDocIds", "requestedObject",
 #       "resourceOwner", "resourceTenantId", "tenantId", "scopes" },
 #     "context": { "decisionId", "source", "policy" } }
@@ -112,13 +112,16 @@ allow if {
 
 # ---------- Operation level (receiving agents enforce independently) ----------
 
-# Recon: the requested target must be inside the signed run scope.
+# Recon: the requested target must be inside the signed run scope and the
+# action must be present in the signed run grant. The Tool Broker additionally
+# requires the target to be inside the trusted run record's scope.
 allow if {
   input.kind == "operation"
   input.attributes.action == "recon.run"
   input.attributes.workload == "orchestrator"
   input.attributes.agent == "recon"
   input.attributes.requestedAction == "recon.run"
+  input.attributes.requestedAction in input.attributes.approvedActions
   input.attributes.requestedTarget in input.attributes.approvedTargets
 }
 
@@ -130,6 +133,7 @@ allow if {
   input.attributes.workload == "orchestrator"
   input.attributes.agent == "knowledge"
   input.attributes.requestedAction == "knowledge.search"
+  input.attributes.requestedAction in input.attributes.approvedActions
   resource_owned
   tenant_matched
 }
@@ -141,6 +145,7 @@ allow if {
   input.attributes.workload == "orchestrator"
   input.attributes.agent == "knowledge"
   input.attributes.requestedAction == "knowledge.index"
+  input.attributes.requestedAction in input.attributes.approvedActions
   resource_owned
   tenant_matched
 }
@@ -152,6 +157,7 @@ allow if {
   input.attributes.workload == "orchestrator"
   input.attributes.agent == "report"
   input.attributes.requestedAction == "report.generate"
+  input.attributes.requestedAction in input.attributes.approvedActions
   input.attributes.requestedRunId == input.attributes.runId
   resource_owned
   tenant_matched

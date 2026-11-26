@@ -22,6 +22,7 @@ import {
   TestAuditProvider,
   makeMemoryService,
   makeTestIdentity,
+  makeToolBroker,
   opaSecurity,
 } from "../helpers/testkit.js";
 
@@ -50,6 +51,7 @@ function workerApp(
     repos,
     security: sec,
     memory: makeMemoryService(sec, repos.runs, stores),
+    tools: makeToolBroker(sec, repos),
   };
   const handler =
     agent === "recon"
@@ -135,9 +137,9 @@ describe("Phase-2 privilege escalation scenarios", () => {
     const repos = new FakeRepositories();
     const sec = security();
     const app = workerApp("recon", sec, repos);
-    const runId = newId();
+    const run = await repos.runs.create({ name: "r", scope: { targets: ["host-1"] }, userId: "user:alice" });
+    const runId = run.runId;
     const grant = await childGrant({ runId, audience: "a2a:recon", actions: ["recon.run"], targets: ["host-1"] });
-    await repos.runs.create({ name: "r", scope: { targets: ["host-1"] }, userId: "user:alice" });
 
     const viaA2A = await sendTask(app, grant.token, {
       taskId: newId(),
@@ -150,13 +152,16 @@ describe("Phase-2 privilege escalation scenarios", () => {
     // The agent's own executor PEP denies even without the A2A layer.
     const executor = new ReconExecutor();
     await expect(
-      executor.execute({ log, audit: sec.audit, repos, security: sec }, {
-        taskId: newId(),
-        runId,
-        kind: "recon.run",
-        input: { target: "evil.test" },
-        authz: grant.context,
-      }),
+      executor.execute(
+        { log, audit: sec.audit, repos, security: sec, tools: makeToolBroker(sec, repos) },
+        {
+          taskId: newId(),
+          runId,
+          kind: "recon.run",
+          input: { target: "evil.test" },
+          authz: grant.context,
+        },
+      ),
     ).rejects.toMatchObject({ status: 403 });
   });
 
@@ -174,7 +179,13 @@ describe("Phase-2 privilege escalation scenarios", () => {
       tenantId: "tenant-2",
       metadata: {},
     });
-    const runId = newId();
+    const run = await repos.runs.create({
+      name: "r",
+      scope: { targets: ["host-1"] },
+      userId: "user:alice",
+      tenantId: "tenant-1",
+    });
+    const runId = run.runId;
     const grant = await childGrant({
       runId,
       audience: "a2a:knowledge",
@@ -191,6 +202,7 @@ describe("Phase-2 privilege escalation scenarios", () => {
           repos,
           security: sec,
           memory: makeMemoryService(sec, repos.runs, stores),
+          tools: makeToolBroker(sec, repos),
         },
         {
           taskId: newId(),
@@ -216,13 +228,16 @@ describe("Phase-2 privilege escalation scenarios", () => {
     });
 
     await expect(
-      new ReportExecutor().execute({ log, audit: sec.audit, repos, security: sec }, {
-        taskId: newId(),
-        runId: run.runId,
-        kind: "report.generate",
-        input: { reportKind: "overview" },
-        authz: grant.context,
-      }),
+      new ReportExecutor().execute(
+        { log, audit: sec.audit, repos, security: sec, tools: makeToolBroker(sec, repos) },
+        {
+          taskId: newId(),
+          runId: run.runId,
+          kind: "report.generate",
+          input: { reportKind: "overview" },
+          authz: grant.context,
+        },
+      ),
     ).rejects.toMatchObject({ status: 403 });
   });
 
@@ -230,18 +245,21 @@ describe("Phase-2 privilege escalation scenarios", () => {
     // (a) a spoofed body field does not change the verified run grant.
     const repos = new FakeRepositories();
     const sec = security();
-    await repos.runs.create({ name: "r", scope: { targets: ["host-1"] }, userId: "user:alice" });
-    const runId = newId();
+    const run = await repos.runs.create({ name: "r", scope: { targets: ["host-1"] }, userId: "user:alice" });
+    const runId = run.runId;
     const grant = await childGrant({ runId, audience: "a2a:recon", actions: ["recon.run"], targets: ["host-1"] });
 
     await expect(
-      new ReconExecutor().execute({ log, audit: sec.audit, repos, security: sec }, {
-        taskId: newId(),
-        runId,
-        kind: "recon.run",
-        input: { target: "evil.test", approvedTargets: ["evil.test"] },
-        authz: grant.context,
-      }),
+      new ReconExecutor().execute(
+        { log, audit: sec.audit, repos, security: sec, tools: makeToolBroker(sec, repos) },
+        {
+          taskId: newId(),
+          runId,
+          kind: "recon.run",
+          input: { target: "evil.test", approvedTargets: ["evil.test"] },
+          authz: grant.context,
+        },
+      ),
     ).rejects.toMatchObject({ status: 403 });
 
     // (b) a tampered token is rejected before any policy runs.
@@ -336,8 +354,8 @@ describe("Phase-2 privilege escalation scenarios", () => {
     const audit = new TestAuditProvider();
     const sec = security(undefined, audit);
     const app = workerApp("recon", sec, repos);
-    await repos.runs.create({ name: "r", scope: { targets: ["host-1"] }, userId: "user:alice" });
-    const runId = newId();
+    const run = await repos.runs.create({ name: "r", scope: { targets: ["host-1"] }, userId: "user:alice" });
+    const runId = run.runId;
     const { token } = await childGrant({ runId, audience: "a2a:recon", actions: ["recon.run"], targets: ["host-1"] });
 
     const res = await sendTask(app, token, {

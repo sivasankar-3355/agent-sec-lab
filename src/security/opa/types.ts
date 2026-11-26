@@ -17,6 +17,7 @@ export interface AuthorizationAttributes {
   approvedTargets: string[];
   approvedActions: string[];
   requestedAction: string;
+  requestedTool: string;
   requestedTarget: string;
   requestedRunId: string;
   requestedDocIds: string[];

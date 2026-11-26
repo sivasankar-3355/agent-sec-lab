@@ -3,6 +3,7 @@ import { AppError, NotFoundError } from "../core/errors.js";
 import type { Repositories } from "../db/repositories/build.js";
 import type { AuditProvider, VerifiedContext } from "../security/protocols.js";
 import type { SecurityProviders } from "../security/container.js";
+import type { ToolBroker } from "../security/tools/index.js";
 import type { MemoryService } from "./memory.js";
 import { createAgentCard } from "../a2a/agentCard.js";
 import type { A2AHandler, CallContext } from "../a2a/handler.js";
@@ -28,6 +29,8 @@ export interface WorkerContext {
   security: SecurityProviders;
   /** Authorized memory service; agents never get the raw memory repository. */
   memory?: MemoryService;
+  /** Centralized tool execution layer; the only way an agent runs a tool. */
+  tools: ToolBroker;
 }
 
 export interface WorkerExecuteInput {
@@ -36,6 +39,8 @@ export interface WorkerExecuteInput {
   kind: TaskKind;
   input: Record<string, unknown>;
   authz?: VerifiedContext;
+  /** Aborted when the task is cancelled. Tool execution must honor it. */
+  signal?: AbortSignal;
 }
 
 export interface WorkerExecutor {
@@ -81,6 +86,7 @@ export class BaseWorkerHandler implements A2AHandler {
   private readonly acceptedKinds: readonly TaskKind[];
   private readonly tasks = new Map<string, MemoryTask>();
   private readonly running = new Map<string, Promise<void>>();
+  private readonly aborts = new Map<string, AbortController>();
 
   constructor(agent: AgentKind, executor: WorkerExecutor, ctx: WorkerContext, acceptedKinds: readonly TaskKind[]) {
     this.agent = agent;
@@ -136,7 +142,9 @@ export class BaseWorkerHandler implements A2AHandler {
 
     const record: MemoryTask = { init: task, status: "submitted" };
     this.tasks.set(task.taskId, record);
-    this.running.set(task.taskId, this.run(task, ctx?.verified));
+    const controller = new AbortController();
+    this.aborts.set(task.taskId, controller);
+    this.running.set(task.taskId, this.run(task, ctx?.verified, controller));
     return { task: this.toA2A(record) };
   }
 
@@ -156,6 +164,8 @@ export class BaseWorkerHandler implements A2AHandler {
     }
     record.status = "canceled";
     this.running.delete(id);
+    this.aborts.get(id)?.abort();
+    this.aborts.delete(id);
     void this.ctx.audit.emit({
       type: "task.cancelled",
       ts: new Date().toISOString(),
@@ -171,7 +181,11 @@ export class BaseWorkerHandler implements A2AHandler {
     await Promise.all([...this.running.values()]);
   }
 
-  private async run(task: TaskInit, authz?: VerifiedContext): Promise<void> {
+  private async run(
+    task: TaskInit,
+    authz?: VerifiedContext,
+    controller?: AbortController,
+  ): Promise<void> {
     this.tasks.get(task.taskId)!.status = "working";
     void this.ctx.audit.emit({
       type: "task.started",
@@ -188,6 +202,7 @@ export class BaseWorkerHandler implements A2AHandler {
         kind: task.kind,
         input: task.input,
         ...(authz !== undefined ? { authz } : {}),
+        ...(controller !== undefined ? { signal: controller.signal } : {}),
       });
       const record = this.tasks.get(task.taskId);
       if (!record || record.status === "canceled") return;
@@ -217,6 +232,7 @@ export class BaseWorkerHandler implements A2AHandler {
       });
     } finally {
       this.running.delete(task.taskId);
+      this.aborts.delete(task.taskId);
     }
   }
 

@@ -54,6 +54,7 @@ export function buildAuthorizationInput(
     approvedTargets: strs(resource.approvedTargets),
     approvedActions: strs(resource.approvedActions),
     requestedAction: str(resource.requestedAction),
+    requestedTool: str(resource.requestedTool),
     requestedTarget: str(resource.requestedTarget),
     requestedRunId: str(resource.requestedRunId),
     requestedDocIds: strs(resource.requestedDocIds),

@@ -49,6 +49,13 @@ describe("A2A protocol contract", () => {
     expect(() => validateTaskInput("knowledge.search", { query: "" })).toThrow(ValidationError);
     expect(() => validateTaskInput("report.generate", { reportKind: "bogus" })).toThrow(ValidationError);
     expect(() => validateTaskInput("recon.run", {})).toThrow(ValidationError);
+    // An ordinary task instruction cannot add a tool or widen permissions.
+    expect(() =>
+      validateTaskInput("recon.run", { target: "host-a", tool: "knowledge.search" }),
+    ).toThrow(ValidationError);
+    expect(() =>
+      validateTaskInput("knowledge.search", { query: "tls?", allowedTools: ["report.generate"] }),
+    ).toThrow(ValidationError);
   });
 
   it("accepts a valid tasks/send JSON-RPC envelope", () => {

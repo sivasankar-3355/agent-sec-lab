@@ -16,6 +16,8 @@ export interface AuthzResource {
   approvedActions?: readonly string[];
   /** Requested (untrusted) intent, checked against approved attributes. */
   requestedAction?: string;
+  /** Code-owned tool identifier; the model never supplies this. */
+  requestedTool?: string;
   requestedTarget?: string;
   requestedRunId?: string;
   requestedDocIds?: readonly string[];
@@ -35,6 +37,33 @@ export interface Decision {
 export interface SandboxStep {
   name: string;
   input: unknown;
+  /**
+   * Verified target envelope. When present, the sandbox adapter MUST connect
+   * only to `addresses` (pinned) and MUST NOT follow redirects beyond
+   * `constraints.maxRedirects` without re-validating the destination with the
+   * same scope rules. The broker resolves and validates the addresses before
+   * the step is dispatched.
+   */
+  target?: ResolvedTarget;
+  constraints?: {
+    maxRedirects: number;
+    allowPrivate: boolean;
+  };
+}
+
+/**
+ * A tool target after syntax canonicalization and (for hostnames) trusted DNS
+ * resolution. `addresses` are the pinned A/AAAA results the sandbox must use;
+ * `canonical` is the value checked against the run scope and the signed grant.
+ */
+export interface ResolvedTarget {
+  input: string;
+  canonical: string;
+  host: string;
+  scheme?: string;
+  port?: number;
+  addresses: readonly string[];
+  allowPrivate: boolean;
 }
 
 export interface SandboxResult {
