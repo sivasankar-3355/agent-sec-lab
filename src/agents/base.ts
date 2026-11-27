@@ -1,10 +1,7 @@
 import type { Logger } from "pino";
 import { AppError, NotFoundError } from "../core/errors.js";
-import type { Repositories } from "../db/repositories/build.js";
 import type { AuditProvider, VerifiedContext } from "../security/protocols.js";
-import type { SecurityProviders } from "../security/container.js";
 import type { ToolBroker } from "../security/tools/index.js";
-import type { MemoryService } from "./memory.js";
 import { createAgentCard } from "../a2a/agentCard.js";
 import type { A2AHandler, CallContext } from "../a2a/handler.js";
 import {
@@ -25,11 +22,11 @@ import { inspectUntrustedContent } from "../security/prompt/index.js";
 export interface WorkerContext {
   log: Logger;
   audit: AuditProvider;
-  repos: Repositories;
-  security: SecurityProviders;
-  /** Authorized memory service; agents never get the raw memory repository. */
-  memory?: MemoryService;
-  /** Centralized tool execution layer; the only way an agent runs a tool. */
+  /**
+   * Centralized tool execution layer. This is the agent's only execution
+   * surface: the worker context deliberately exposes no raw repositories,
+   * memory stores, sandbox/network providers or credentials.
+   */
   tools: ToolBroker;
 }
 

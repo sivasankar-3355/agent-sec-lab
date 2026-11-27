@@ -48,6 +48,8 @@ export interface SandboxStep {
   constraints?: {
     maxRedirects: number;
     allowPrivate: boolean;
+    /** The adapter must connect only to `target.addresses`, not re-resolve. */
+    pinAddresses: boolean;
   };
 }
 

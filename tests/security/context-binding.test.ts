@@ -77,8 +77,6 @@ beforeAll(async () => {
     {
       log,
       audit: security.audit,
-      repos,
-      security,
       tools: makeToolBroker(security, repos),
     },
     reconAcceptedKinds,

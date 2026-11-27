@@ -29,11 +29,15 @@ import type {
 import type { MemoryRecord } from "../../src/core/memory.js";
 import type { MemoryStores } from "../../src/db/memory-store.js";
 import { createMemoryService, type MemoryService } from "../../src/agents/memory.js";
-import { agentToolRegistry } from "../../src/agents/tools.js";
+import { LocalToolExecutor } from "../../src/agents/tool-executor.js";
+import { agentToolCatalog, ToolCatalog } from "../../src/agents/tool-catalog.js";
+import type { ToolOperation } from "../../src/agents/tool-operation.js";
 import {
+  ToolRegistry,
   createToolBroker,
   type TargetResolver,
   type ToolBroker,
+  type ToolSpec,
 } from "../../src/security/tools/index.js";
 import type { Coordinator } from "../../src/db/coordinator.js";
 import type { ChildTaskBroker } from "../../src/agents/orchestrator/broker.js";
@@ -853,18 +857,42 @@ export function makeMemoryService(
   });
 }
 
-/** Tool Broker wired to the production registry and test security providers. */
+/** Tool Broker wired to the production catalog and test security providers. */
 export function makeToolBroker(
   security: FailClosedSecurityProviders,
   repos: FakeRepositories,
-  options: { resolver?: TargetResolver } = {},
+  options: { memory?: MemoryService; resolver?: TargetResolver; catalog?: ToolCatalog } = {},
 ): ToolBroker {
+  const catalog = options.catalog ?? agentToolCatalog;
+  const executor = new LocalToolExecutor(catalog, {
+    audit: security.audit,
+    policy: security.policy,
+    model: security.model,
+    crypto: security.crypto,
+    repos,
+    sandbox: security.sandbox,
+    ...(options.memory !== undefined ? { memory: options.memory } : {}),
+  });
   return createToolBroker({
-    registry: agentToolRegistry,
+    registry: catalog.registry,
+    executor,
     authz: security.authz,
     audit: security.audit,
     network: security.network,
     resolver: options.resolver ?? new TestTargetResolver(),
     resolveRun: (runId) => repos.runs.get(runId),
   });
+}
+
+/** Build a sealed test catalog with exactly the supplied specs/operations. */
+export function makeTestCatalog(
+  entries: ReadonlyArray<{ spec: ToolSpec; operation: ToolOperation }>,
+): ToolCatalog {
+  const registry = new ToolRegistry();
+  for (const entry of entries) registry.register(entry.spec);
+  registry.seal();
+  const catalog = new ToolCatalog(registry);
+  for (const entry of entries) catalog.register(entry.spec, entry.operation);
+  catalog.seal();
+  return catalog;
 }

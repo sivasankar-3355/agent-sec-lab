@@ -30,7 +30,7 @@ export async function bootWorker(
     audit: security.audit,
     embedding: security.embedding,
   });
-  const tools = createAgentToolBroker(security, repos);
+  const tools = createAgentToolBroker(security, repos, memory);
 
   const handler = new BaseWorkerHandler(
     agent,
@@ -38,9 +38,6 @@ export async function bootWorker(
     {
       log,
       audit: security.audit,
-      repos,
-      security,
-      memory,
       tools,
     },
     acceptedKinds,

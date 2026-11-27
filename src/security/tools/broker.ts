@@ -1,4 +1,3 @@
-import type { ZodTypeAny, output } from "zod";
 import type { RunRecord } from "../../core/domain.js";
 import { AppError, EgressDeniedError, ValidationError } from "../../core/errors.js";
 import { inspectUntrustedContent } from "../prompt/audit.js";
@@ -19,10 +18,10 @@ import {
   resolveParsedTarget,
 } from "./targets.js";
 import type { ParsedToolTarget } from "./targets.js";
+import type { ToolExecutionRequest, ToolExecutor } from "./executor.js";
 import type {
   TargetResolver,
   ToolActor,
-  ToolCallContext,
   ToolRequest,
   ToolResult,
   ToolSpec,
@@ -34,6 +33,8 @@ const MAX_INSPECT_CHARS = 64 * 1024;
 
 export interface ToolBrokerOptions {
   registry: ToolRegistry;
+  /** Pluggable execution backend; local in Phase 5, sandboxed in Phase 7. */
+  executor: ToolExecutor;
   authz: AuthorizationProvider;
   audit: AuditProvider;
   network: NetworkPolicyProvider;
@@ -93,12 +94,14 @@ function assertSafeArgKeys(value: unknown): void {
  *  - rate, concurrency, timeout, cancellation and output-size limits;
  *  - output schema validation, provenance and prompt-injection inspection.
  *
- * It never parses a tool name or arguments from model output. Callers pass a
- * code-owned `ToolSpec` object; the broker verifies that it is the exact
- * registered definition before doing anything else.
+ * The code-owned operation is selected by the pluggable executor from a sealed
+ * catalog; agents never pass a handler, operation, executable or permission.
+ *
+ * The broker never parses a tool name or arguments from model output.
  */
 export class ToolBroker {
   private readonly registry: ToolRegistry;
+  private readonly executor: ToolExecutor;
   private readonly authz: AuthorizationProvider;
   private readonly audit: AuditProvider;
   private readonly network: NetworkPolicyProvider;
@@ -113,6 +116,7 @@ export class ToolBroker {
       throw new Error("tool registry must be sealed before the tool broker is created");
     }
     this.registry = options.registry;
+    this.executor = options.executor;
     this.authz = options.authz;
     this.audit = options.audit;
     this.network = options.network;
@@ -121,31 +125,29 @@ export class ToolBroker {
     this.now = options.now ?? (() => Date.now());
   }
 
-  async execute<S extends ZodTypeAny, R>(
-    spec: ToolSpec<S>,
+  async execute(
     actor: ToolActor,
     request: ToolRequest,
-    handler: (call: ToolCallContext<output<S>>) => Promise<R>,
     options: { signal?: AbortSignal } = {},
-  ): Promise<ToolResult<R>> {
+  ): Promise<ToolResult<unknown>> {
     const started = this.now();
 
     if (!this.isValidRequest(request)) {
       return this.deny(actor, "unknown", "invalid tool request", "validation_error", 422);
     }
 
-    let registered: ToolSpec;
+    let spec: ToolSpec;
     try {
-      registered = this.registry.requireForAgent(request.name, actor.agent);
+      spec = this.registry.requireForAgent(request.name, actor.agent);
     } catch (err) {
       const error = this.safeError(err);
       return this.deny(actor, request.name, error.message, error.code, error.status);
     }
-    if (registered !== spec) {
+    if (!this.executor.supports(spec.name)) {
       return this.deny(
         actor,
-        request.name,
-        "tool definition does not match the registered definition",
+        spec.name,
+        `executor does not support tool '${spec.name}'`,
         "tool_not_registered",
         403,
       );
@@ -185,7 +187,7 @@ export class ToolBroker {
       return this.deny(actor, spec.name, error.message, error.code, error.status);
     }
 
-    let args = parsed.data as output<S>;
+    let args = parsed.data as Record<string, unknown>;
     let parsedTarget: ParsedToolTarget | undefined;
     let targetRule: ToolTargetRule | undefined;
     let approvedTargets: readonly string[] = actor.approvedTargets;
@@ -244,7 +246,6 @@ export class ToolBroker {
         args,
         target,
         decision,
-        handler,
         options.signal,
       );
 
@@ -278,6 +279,7 @@ export class ToolBroker {
         data: {
           tool: spec.name,
           agent: actor.agent,
+          executor: this.executor.kind,
           risk: spec.risk,
           action: spec.requiredAction,
           decision_rule: decision.rule ?? null,
@@ -316,6 +318,7 @@ export class ToolBroker {
         data: {
           tool: spec.name,
           agent: actor.agent,
+          executor: this.executor.kind,
           code: error.code,
           error_name: error.name,
           duration_ms: this.now() - started,
@@ -380,13 +383,13 @@ export class ToolBroker {
     }
   }
 
-  private prepareTarget<S extends ZodTypeAny>(
-    spec: ToolSpec<S>,
+  private prepareTarget(
+    spec: ToolSpec,
     actor: ToolActor,
     run: RunRecord,
-    args: output<S>,
+    args: Record<string, unknown>,
   ): {
-    args: output<S>;
+    args: Record<string, unknown>;
     parsedTarget?: ParsedToolTarget;
     targetRule?: ToolTargetRule;
     approvedTargets: readonly string[];
@@ -394,7 +397,7 @@ export class ToolBroker {
     const rule = spec.target;
     if (rule === undefined) return { args, approvedTargets: actor.approvedTargets };
 
-    const raw = (args as Record<string, unknown>)[rule.field];
+    const raw = args[rule.field];
     if (typeof raw !== "string") {
       throw new ValidationError(`tool '${spec.name}' requires a string target`);
     }
@@ -408,7 +411,7 @@ export class ToolBroker {
     });
 
     return {
-      args: { ...(args as Record<string, unknown>), [rule.field]: parsed.canonical } as output<S>,
+      args: { ...args, [rule.field]: parsed.canonical },
       parsedTarget: parsed,
       targetRule: rule,
       approvedTargets,
@@ -427,15 +430,15 @@ export class ToolBroker {
     }
   }
 
-  private async authorize<S extends ZodTypeAny>(
-    spec: ToolSpec<S>,
+  private async authorize(
+    spec: ToolSpec,
     actor: ToolActor,
     run: RunRecord,
-    args: output<S>,
+    args: Record<string, unknown>,
     requestedTarget: string | undefined,
     approvedTargets: readonly string[],
   ): Promise<Decision> {
-    const docIds = (args as Record<string, unknown>).docIds;
+    const docIds = args.docIds;
     const resource: AuthzResource = {
       kind: "operation",
       workload: actor.workload,
@@ -500,16 +503,15 @@ export class ToolBroker {
     };
   }
 
-  private async runWithLimits<S extends ZodTypeAny, R>(
-    spec: ToolSpec<S>,
+  private async runWithLimits(
+    spec: ToolSpec,
     actor: ToolActor,
     run: RunRecord,
-    args: output<S>,
+    args: Record<string, unknown>,
     target: ResolvedTarget | undefined,
     decision: Decision,
-    handler: (call: ToolCallContext<output<S>>) => Promise<R>,
     parentSignal: AbortSignal | undefined,
-  ): Promise<R> {
+  ): Promise<unknown> {
     const controller = new AbortController();
     const onParentAbort = (): void => controller.abort(new ToolAbortReason("cancelled"));
     if (parentSignal !== undefined) {
@@ -519,19 +521,21 @@ export class ToolBroker {
     const timer = setTimeout(() => controller.abort(new ToolAbortReason("timeout")), spec.limits.timeoutMs);
     timer.unref();
 
-    const call: ToolCallContext<output<S>> = {
+    const executionRequest: ToolExecutionRequest = {
+      tool: spec.name,
       args,
+      ...(target !== undefined ? { target } : {}),
+      signal: controller.signal,
       actor,
       run,
-      signal: controller.signal,
       decision,
-      ...(target !== undefined ? { target } : {}),
+      limits: spec.limits,
     };
 
     try {
-      const work = handler(call);
-      // If the timeout wins the race, the handler may still settle later; do not
-      // let that become an unhandled rejection.
+      const work = this.executor.execute(executionRequest);
+      // If the timeout wins the race, the executor may still settle later; do
+      // not let that become an unhandled rejection.
       work.catch(() => {});
       return await Promise.race([work, abortPromise(controller.signal)]);
     } catch (err) {

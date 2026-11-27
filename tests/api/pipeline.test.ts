@@ -91,14 +91,14 @@ async function bootAgent(handler: A2AHandler, security: FailClosedSecurityProvid
   return bootServer(app);
 }
 
-const workerCtx = (security: FailClosedSecurityProviders) => ({
-  log,
-  audit: security.audit,
-  repos,
-  security,
-  memory: makeMemoryService(security, repos.runs, memoryStores),
-  tools: makeToolBroker(security, repos),
-});
+const workerCtx = (security: FailClosedSecurityProviders) => {
+  const memory = makeMemoryService(security, repos.runs, memoryStores);
+  return {
+    log,
+    audit: security.audit,
+    tools: makeToolBroker(security, repos, { memory }),
+  };
+};
 
 beforeAll(async () => {
   const reconUrl = await bootAgent(

@@ -50,10 +50,21 @@ export const reportGenerateOutputSchema = z
   })
   .strict();
 
+export const reconSnapshotOutputSchema = z
+  .object({
+    findings: z.array(z.string().min(1)),
+  })
+  .strict();
+
 export const reconSnapshotTool = defineTool({
   name: "recon.snapshot",
   description: "Collect reconnaissance observations for an approved target.",
-  schema: z.object({ target: z.string().trim().min(1).max(2048) }).strict(),
+  schema: z
+    .object({
+      target: z.string().trim().min(1).max(2048),
+      rulesRef: z.string().trim().min(1).max(256).optional(),
+    })
+    .strict(),
   allowedAgents: ["recon"],
   requiredAction: "recon.run",
   risk: "medium",
@@ -64,9 +75,7 @@ export const reconSnapshotTool = defineTool({
     maxConcurrency: 4,
     rateLimit: { maxCalls: 30, windowMs: 60_000 },
   },
-  // The sandbox output shape is adapter-owned. The broker still bounds its
-  // size, tags it untrusted and inspects it for injection; the prompt layer
-  // places it in an UNTRUSTED_DATA envelope.
+  outputSchema: reconSnapshotOutputSchema,
 });
 
 export const knowledgeSearchTool = defineTool({

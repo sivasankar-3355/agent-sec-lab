@@ -45,13 +45,11 @@ function workerApp(
   repos: FakeRepositories,
   stores: FakeMemoryStores = new FakeMemoryStores(),
 ): Application {
+  const memory = makeMemoryService(sec, repos.runs, stores);
   const ctx: WorkerContext = {
     log,
     audit: sec.audit,
-    repos,
-    security: sec,
-    memory: makeMemoryService(sec, repos.runs, stores),
-    tools: makeToolBroker(sec, repos),
+    tools: makeToolBroker(sec, repos, { memory }),
   };
   const handler =
     agent === "recon"
@@ -153,7 +151,7 @@ describe("Phase-2 privilege escalation scenarios", () => {
     const executor = new ReconExecutor();
     await expect(
       executor.execute(
-        { log, audit: sec.audit, repos, security: sec, tools: makeToolBroker(sec, repos) },
+        { log, audit: sec.audit, tools: makeToolBroker(sec, repos) },
         {
           taskId: newId(),
           runId,
@@ -194,15 +192,13 @@ describe("Phase-2 privilege escalation scenarios", () => {
       tenantId: "tenant-1",
     });
 
+    const memory = makeMemoryService(sec, repos.runs, stores);
     await expect(
       new KnowledgeExecutor().execute(
         {
           log,
           audit: sec.audit,
-          repos,
-          security: sec,
-          memory: makeMemoryService(sec, repos.runs, stores),
-          tools: makeToolBroker(sec, repos),
+          tools: makeToolBroker(sec, repos, { memory }),
         },
         {
           taskId: newId(),
@@ -229,7 +225,7 @@ describe("Phase-2 privilege escalation scenarios", () => {
 
     await expect(
       new ReportExecutor().execute(
-        { log, audit: sec.audit, repos, security: sec, tools: makeToolBroker(sec, repos) },
+        { log, audit: sec.audit, tools: makeToolBroker(sec, repos) },
         {
           taskId: newId(),
           runId: run.runId,
@@ -251,7 +247,7 @@ describe("Phase-2 privilege escalation scenarios", () => {
 
     await expect(
       new ReconExecutor().execute(
-        { log, audit: sec.audit, repos, security: sec, tools: makeToolBroker(sec, repos) },
+        { log, audit: sec.audit, tools: makeToolBroker(sec, repos) },
         {
           taskId: newId(),
           runId,
