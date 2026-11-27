@@ -8,6 +8,7 @@ import { createApp } from "./app.js";
 import { buildRuntime, disconnectStores } from "./deps.js";
 import { createMemoryStores } from "../db/memory-store.js";
 import { createMemoryService } from "../agents/memory.js";
+import { CircuitBreaker } from "../core/resilience/circuit.js";
 
 /**
  * The gateway authenticates to the STS with its workload identity and receives
@@ -47,6 +48,23 @@ async function start(): Promise<void> {
     authz: security.authz,
     audit: security.audit,
     embedding: security.embedding,
+    timeoutMs: config.MEMORY_TIMEOUT_MS,
+  });
+
+  const orchestratorBreaker = new CircuitBreaker({
+    name: "a2a:orchestrator",
+    failureThreshold: config.CIRCUIT_FAILURE_THRESHOLD,
+    recoveryIntervalMs: config.CIRCUIT_RECOVERY_INTERVAL_MS,
+    halfOpenMaxCalls: config.CIRCUIT_HALF_OPEN_MAX_CALLS,
+    onStateChange: (from, to) => {
+      log.warn({ from, to }, "orchestrator circuit state changed");
+      void security.audit.emit({
+        type: "resilience.circuit.state",
+        ts: new Date().toISOString(),
+        traceId: "a2a:orchestrator",
+        data: { peer: "orchestrator", from, to },
+      });
+    },
   });
 
   const app = createApp({
@@ -55,7 +73,20 @@ async function start(): Promise<void> {
     stores: runtime.stores,
     repos: runtime.repos,
     memory,
-    ...(config.ORCHESTRATOR_A2A_URL.length > 0 ? { orchestrator: { base: config.ORCHESTRATOR_A2A_URL } } : {}),
+    ...(config.ORCHESTRATOR_A2A_URL.length > 0
+      ? {
+          orchestrator: {
+            base: config.ORCHESTRATOR_A2A_URL,
+            timeoutMs: config.A2A_CALL_TIMEOUT_MS,
+            retry: {
+              maxAttempts: config.A2A_RETRY_MAX_ATTEMPTS,
+              baseDelayMs: config.A2A_RETRY_BASE_DELAY_MS,
+              maxDelayMs: config.A2A_RETRY_MAX_DELAY_MS,
+            },
+            breaker: orchestratorBreaker,
+          },
+        }
+      : {}),
     ...(sts !== undefined ? { sts } : {}),
   });
 

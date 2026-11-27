@@ -1,4 +1,5 @@
 import type { RunRecord } from "../../core/domain.js";
+import type { RunBudget } from "../../core/resilience/index.js";
 import type { Decision, ResolvedTarget } from "../protocols.js";
 import type { ToolActor, ToolLimits } from "./types.js";
 
@@ -24,6 +25,8 @@ export interface ToolExecutionRequest {
   readonly run: RunRecord;
   readonly decision: Decision;
   readonly limits: ToolLimits;
+  /** Trusted run budget resolved by the broker from the run record. */
+  readonly budget: RunBudget;
 }
 
 /**

@@ -8,6 +8,7 @@ import { agentToolCatalog, ToolCatalog } from "../../src/agents/tool-catalog.js"
 import { LocalToolExecutor } from "../../src/agents/tool-executor.js";
 import type { ToolOperation } from "../../src/agents/tool-operation.js";
 import { knowledgeSearchTool, reconSnapshotTool } from "../../src/agents/tools.js";
+import { RunGovernor } from "../../src/core/resilience/index.js";
 import {
   defineTool,
   ToolRegistry,
@@ -41,6 +42,7 @@ function brokerFor(options: {
   authz?: AuthorizationProvider;
   audit?: TestAuditProvider;
   resolver?: TargetResolver;
+  governor?: RunGovernor;
 }): ToolBroker {
   const security = testSecurity(log, {
     ...(options.authz !== undefined ? { authz: options.authz } : {}),
@@ -54,6 +56,7 @@ function brokerFor(options: {
   return makeToolBroker(security, options.repos, {
     ...(options.catalog !== undefined ? { catalog: options.catalog } : {}),
     ...(options.resolver !== undefined ? { resolver: options.resolver } : {}),
+    ...(options.governor !== undefined ? { governor: options.governor } : {}),
   });
 }
 
@@ -438,6 +441,44 @@ describe("Phase-5 tool registry and broker", () => {
 
     release();
     await expect(first).resolves.toMatchObject({ tool: "test.gated" });
+  });
+
+  it("enforces the run-scoped tool-call budget and charges retries", async () => {
+    const repos = new FakeRepositories();
+    const run = await repos.runs.create({
+      name: "budget",
+      scope: { targets: ["host-1"] },
+      userId: "user:alice",
+      config: { budget: { maxToolCalls: 1 } },
+    });
+    const broker = brokerFor({ repos, governor: new RunGovernor() });
+    const actor = actorFor("recon", run);
+    const request = { name: "recon.snapshot", args: { target: "host-1" } };
+
+    await expect(broker.execute(actor, request)).resolves.toMatchObject({ tool: "recon.snapshot" });
+    await expect(broker.execute(actor, request)).rejects.toMatchObject({
+      status: 429,
+      code: "run_budget_exceeded",
+    });
+  });
+
+  it("does not charge the tool budget for a request denied before execution", async () => {
+    const repos = new FakeRepositories();
+    const run = await repos.runs.create({
+      name: "budget-target",
+      scope: { targets: ["host-1"] },
+      userId: "user:alice",
+      config: { budget: { maxToolCalls: 1 } },
+    });
+    const broker = brokerFor({ repos, governor: new RunGovernor() });
+    const actor = actorFor("recon", run);
+
+    await expect(
+      broker.execute(actor, { name: "recon.snapshot", args: { target: "evil.test" } }),
+    ).rejects.toMatchObject({ status: 403, code: "tool_target_denied" });
+    await expect(
+      broker.execute(actor, { name: "recon.snapshot", args: { target: "host-1" } }),
+    ).resolves.toMatchObject({ tool: "recon.snapshot" });
   });
 
   it("times out a slow tool", async () => {

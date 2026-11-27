@@ -46,6 +46,23 @@ const envSchema = z.object({
   WORKLOAD_TOKEN_TTL: z.coerce.number().int().positive().max(86400).default(300),
   RUN_TOKEN_TTL: z.coerce.number().int().positive().max(86400).default(1800),
   CHILD_TOKEN_TTL: z.coerce.number().int().positive().max(86400).default(600),
+  // ---- Phase 6 resilience ----
+  // Agent-to-agent HTTP calls (client deadline and server handler deadline).
+  A2A_CALL_TIMEOUT_MS: z.coerce.number().int().positive().max(60_000).default(5_000),
+  A2A_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().max(60_000).default(5_000),
+  // Bounded retries for idempotent A2A calls (total attempts incl. first).
+  A2A_RETRY_MAX_ATTEMPTS: z.coerce.number().int().positive().max(5).default(2),
+  A2A_RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().max(5_000).default(100),
+  A2A_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().max(30_000).default(2_000),
+  // Per-peer circuit breaker.
+  CIRCUIT_FAILURE_THRESHOLD: z.coerce.number().int().positive().max(100).default(3),
+  CIRCUIT_RECOVERY_INTERVAL_MS: z.coerce.number().int().positive().max(3_600_000).default(15_000),
+  CIRCUIT_HALF_OPEN_MAX_CALLS: z.coerce.number().int().positive().max(10).default(1),
+  // Worker task and optional model/memory deadlines.
+  AGENT_TASK_TIMEOUT_MS: z.coerce.number().int().positive().max(3_600_000).default(120_000),
+  AGENT_MAX_CONCURRENT_TASKS: z.coerce.number().int().positive().max(64).default(8),
+  LLM_TIMEOUT_MS: z.coerce.number().int().positive().max(300_000).default(30_000),
+  MEMORY_TIMEOUT_MS: z.coerce.number().int().positive().max(300_000).default(30_000),
 });
 
 export type Config = z.output<typeof envSchema>;

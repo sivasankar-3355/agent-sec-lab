@@ -8,7 +8,20 @@ import type {
   SandboxStep,
 } from "../security/protocols.js";
 import type { ToolExecutionRequest } from "../security/tools/index.js";
+import type { RunBudget } from "../core/resilience/index.js";
 import type { MemoryService } from "./memory.js";
+
+/**
+ * Narrow run-budget view for code-owned operations. `consumeLlm` returns false
+ * when the configured LLM-call budget is exhausted, allowing a safe degraded
+ * path (e.g. recon still returns the sandbox observation without a model note).
+ */
+export interface OperationBudget {
+  readonly budget: RunBudget;
+  readonly llmTimeoutMs: number;
+  remainingMs(): number;
+  consumeLlm(): Promise<boolean>;
+}
 
 /**
  * External-effect boundary available to a tool operation. The local executor
@@ -34,6 +47,7 @@ export interface ToolOperationContext {
   readonly repos: Repositories;
   readonly memory?: MemoryService;
   readonly runtime: ToolRuntime;
+  readonly budget: OperationBudget;
 }
 
 export type ToolOperation = (context: ToolOperationContext) => Promise<unknown>;

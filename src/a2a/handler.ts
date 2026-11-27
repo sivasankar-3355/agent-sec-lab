@@ -6,6 +6,8 @@ import type { VerifiedContext } from "../security/protocols.js";
 export interface CallContext {
   verified: VerifiedContext;
   token?: string;
+  /** Aborted when the client disconnects or the server request deadline wins. */
+  signal?: AbortSignal;
 }
 
 export interface A2AHandler {

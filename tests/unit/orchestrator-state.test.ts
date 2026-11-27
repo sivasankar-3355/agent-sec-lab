@@ -8,6 +8,7 @@ describe("run state machine", () => {
   it("allows the forward pipeline", () => {
     expect(canTransition("CREATED", "STARTED")).toBe(true);
     expect(canTransition("CREATED", "FAILED")).toBe(true);
+    expect(canTransition("CREATED", "CANCELLED")).toBe(true);
     expect(canTransition("STARTED", "RECON")).toBe(true);
     expect(canTransition("RECON", "KNOWLEDGE")).toBe(true);
     expect(canTransition("KNOWLEDGE", "REPORT")).toBe(true);

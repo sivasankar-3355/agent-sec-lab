@@ -137,7 +137,12 @@ export interface EmbeddingProvider {
 }
 
 export interface ModelProvider {
-  complete(prompt: string, context: Record<string, unknown>): Promise<Completion>;
+  complete(
+    prompt: string,
+    context: Record<string, unknown>,
+    /** Cooperative deadline/cancellation for the provider call when supported. */
+    options?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<Completion>;
 }
 
 export interface TokenVerdict {

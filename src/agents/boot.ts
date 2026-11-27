@@ -11,6 +11,8 @@ import { createMemoryService } from "./memory.js";
 import { createAgentToolBroker } from "./tooling.js";
 import type { AgentKind, TaskKind } from "../a2a/schema.js";
 import { a2aAudience } from "../security/audience.js";
+import { RunGovernor } from "../core/resilience/index.js";
+import { RedisRunBudgetStore } from "../db/run-budget-store.js";
 
 export async function bootWorker(
   agent: AgentKind,
@@ -29,8 +31,13 @@ export async function bootWorker(
     authz: security.authz,
     audit: security.audit,
     embedding: security.embedding,
+    timeoutMs: config.MEMORY_TIMEOUT_MS,
   });
-  const tools = createAgentToolBroker(security, repos, memory);
+  const governor = new RunGovernor({ store: new RedisRunBudgetStore(stores.redis!) });
+  const tools = createAgentToolBroker(security, repos, memory, {
+    governor,
+    llmTimeoutMs: config.LLM_TIMEOUT_MS,
+  });
 
   const handler = new BaseWorkerHandler(
     agent,
@@ -41,6 +48,10 @@ export async function bootWorker(
       tools,
     },
     acceptedKinds,
+    {
+      taskTimeoutMs: config.AGENT_TASK_TIMEOUT_MS,
+      maxConcurrentTasks: config.AGENT_MAX_CONCURRENT_TASKS,
+    },
   );
 
   const app = express();
@@ -54,6 +65,7 @@ export async function bootWorker(
       audit: security.audit,
       agent,
       audience: a2aAudience(agent),
+      requestTimeoutMs: config.A2A_REQUEST_TIMEOUT_MS,
     }),
   );
 

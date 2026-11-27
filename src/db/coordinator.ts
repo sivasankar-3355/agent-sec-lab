@@ -3,6 +3,8 @@ import type { RedisStore } from "./redis.js";
 
 export interface Coordinator {
   acquireLock(key: string, ttlMs?: number): Promise<boolean>;
+  /** Extend a held lock; returns false if the lock is no longer held. */
+  extendLock(key: string, ttlMs?: number): Promise<boolean>;
   releaseLock(key: string): Promise<void>;
   ensureSeen(key: string, ttlMs?: number): Promise<boolean>;
 }
@@ -34,6 +36,13 @@ export function createRedisCoordinator(redis: RedisStore): Coordinator {
   return {
     async acquireLock(key, ttlMs = 30_000): Promise<boolean> {
       return setOnce(key, ttlMs);
+    },
+    async extendLock(key, ttlMs = 30_000): Promise<boolean> {
+      try {
+        return (await client.pexpire(key, seconds(ttlMs) * 1000)) === 1;
+      } catch {
+        throw new A2AError("coordination control (Redis) unavailable", 503);
+      }
     },
     async releaseLock(key): Promise<void> {
       await client.del(key);

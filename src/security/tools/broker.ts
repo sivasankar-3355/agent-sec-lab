@@ -1,5 +1,7 @@
 import type { RunRecord } from "../../core/domain.js";
 import { AppError, EgressDeniedError, ValidationError } from "../../core/errors.js";
+import { BudgetExceededError, RunGovernor } from "../../core/resilience/index.js";
+import { withDeadline } from "../../core/resilience/abort.js";
 import { inspectUntrustedContent } from "../prompt/audit.js";
 import type {
   AuditProvider,
@@ -42,6 +44,10 @@ export interface ToolBrokerOptions {
   resolveRun: (runId: string) => Promise<RunRecord | null>;
   resolver?: TargetResolver;
   now?: () => number;
+  /** Shared run-scoped budget/deadline enforcer. */
+  governor?: RunGovernor;
+  /** Bound for resolver/OPA/egress prechecks (default 5s). */
+  precheckTimeoutMs?: number;
 }
 
 class ToolAbortReason {
@@ -108,6 +114,8 @@ export class ToolBroker {
   private readonly resolveRun: (runId: string) => Promise<RunRecord | null>;
   private readonly resolver: TargetResolver;
   private readonly now: () => number;
+  private readonly governor: RunGovernor;
+  private readonly precheckTimeoutMs: number;
   private readonly calls = new Map<string, number[]>();
   private readonly active = new Map<string, number>();
 
@@ -123,6 +131,8 @@ export class ToolBroker {
     this.resolveRun = options.resolveRun;
     this.resolver = options.resolver ?? new DnsTargetResolver();
     this.now = options.now ?? (() => Date.now());
+    this.governor = options.governor ?? new RunGovernor();
+    this.precheckTimeoutMs = Math.max(1, options.precheckTimeoutMs ?? 5_000);
   }
 
   async execute(
@@ -182,6 +192,8 @@ export class ToolBroker {
     const run = await this.loadRun(actor, spec);
     try {
       this.assertRunBinding(actor, run);
+      // A run past its trusted execution deadline accepts no new tool work.
+      this.governor.assertWithinDuration(run);
     } catch (err) {
       const error = this.safeError(err);
       return this.deny(actor, spec.name, error.message, error.code, error.status);
@@ -204,7 +216,10 @@ export class ToolBroker {
 
     let decision: Decision;
     try {
-      decision = await this.authorize(spec, actor, run, args, parsedTarget?.canonical, approvedTargets);
+      decision = await withDeadline(
+        () => this.authorize(spec, actor, run, args, parsedTarget?.canonical, approvedTargets),
+        { timeoutMs: this.precheckTimeoutMs, label: "tool.authorize" },
+      );
     } catch (err) {
       const error = this.safeError(err);
       return this.deny(actor, spec.name, error.message, error.code, error.status);
@@ -215,8 +230,14 @@ export class ToolBroker {
     let target: ResolvedTarget | undefined;
     if (parsedTarget !== undefined && targetRule !== undefined) {
       try {
-        target = await resolveParsedTarget(parsedTarget, targetRule, this.resolver);
-        await this.assertEgress(target);
+        target = await withDeadline(
+          () => resolveParsedTarget(parsedTarget, targetRule, this.resolver),
+          { timeoutMs: this.precheckTimeoutMs, label: "tool.target.resolve" },
+        );
+        await withDeadline(() => this.assertEgress(target!), {
+          timeoutMs: this.precheckTimeoutMs,
+          label: "tool.egress",
+        });
       } catch (err) {
         const error = this.safeError(err);
         return this.deny(actor, spec.name, error.message, error.code, error.status);
@@ -234,6 +255,18 @@ export class ToolBroker {
     try {
       release = this.acquireConcurrency(actor, spec);
     } catch (err) {
+      const error = this.safeError(err);
+      return this.deny(actor, spec.name, error.message, error.code, error.status);
+    }
+
+    try {
+      // Run-scoped budget: every actual execution attempt (including a retry
+      // that reaches the broker again) consumes one tool-call credit. Denied
+      // authorization/target/rate requests above do not consume execution
+      // budget.
+      await this.governor.consumeToolCall(run);
+    } catch (err) {
+      release();
       const error = this.safeError(err);
       return this.deny(actor, spec.name, error.message, error.code, error.status);
     }
@@ -512,13 +545,25 @@ export class ToolBroker {
     decision: Decision,
     parentSignal: AbortSignal | undefined,
   ): Promise<unknown> {
+    const remainingRunMs = this.governor.remainingMs(run);
+    if (remainingRunMs <= 0) {
+      throw new BudgetExceededError(
+        `run '${run.runId}' exceeded its maximum execution duration`,
+        "run_deadline_exceeded",
+        504,
+      );
+    }
+    // The tool deadline is the smaller of its code-owned limit and the
+    // remaining trusted run budget, so a tool cannot outlive the run.
+    const timeoutMs = Math.max(1, Math.min(spec.limits.timeoutMs, remainingRunMs));
+
     const controller = new AbortController();
     const onParentAbort = (): void => controller.abort(new ToolAbortReason("cancelled"));
     if (parentSignal !== undefined) {
       if (parentSignal.aborted) throw abortError(parentSignal);
       parentSignal.addEventListener("abort", onParentAbort, { once: true });
     }
-    const timer = setTimeout(() => controller.abort(new ToolAbortReason("timeout")), spec.limits.timeoutMs);
+    const timer = setTimeout(() => controller.abort(new ToolAbortReason("timeout")), timeoutMs);
     timer.unref();
 
     const executionRequest: ToolExecutionRequest = {
@@ -530,6 +575,9 @@ export class ToolBroker {
       run,
       decision,
       limits: spec.limits,
+      // Frozen snapshot: an operation cannot widen its own LLM/time budget by
+      // mutating the run object it receives.
+      budget: Object.freeze(this.governor.budgetFor(run)),
     };
 
     try {

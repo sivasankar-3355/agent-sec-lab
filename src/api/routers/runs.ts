@@ -1,11 +1,12 @@
 import { Router } from "express";
 import { z } from "zod";
-import { NotFoundError } from "../../core/errors.js";
+import { AppError, NotFoundError } from "../../core/errors.js";
 import { newId } from "../../core/ids.js";
 import type { FindingSeverity } from "../../core/domain.js";
 import type { TaskInit } from "../../a2a/schema.js";
 import { A2AClient } from "../../a2a/client.js";
 import { A2A_SCOPES, RUN_ACTIONS } from "../../security/audience.js";
+import { DEFAULT_RETRY_POLICY, isRetryable, retry } from "../../core/resilience/retry.js";
 import type { RouterDeps } from "./contract.js";
 import { parseBody, parseId, readUserId, requireAuthorized } from "./contract.js";
 import { inspectUntrustedContent } from "../../security/prompt/index.js";
@@ -83,12 +84,82 @@ export function createRunsRouter(deps: RouterDeps): Router {
           ...(body.config ? { config: body.config } : {}),
         },
       };
+      const canMintFreshToken =
+        deps.orchestrator.token === undefined && deps.sts !== undefined && userId.length > 0;
+      const tokenForAttempt = async (attempt: number): Promise<string> => {
+        if (attempt === 1 || !canMintFreshToken) return dispatchToken!;
+        // Run tokens are single-use (jti replay protection). A retry mints a
+        // fresh token from the STS while reusing the same taskId, so a lost
+        // response cannot create a second run.start.
+        return deps.sts!.mintRun({
+          userId,
+          runId: run.runId,
+          targets: [...body.scope.targets],
+          actions: [...RUN_ACTIONS],
+          correlationId: newId(),
+          scopes: [...A2A_SCOPES],
+        });
+      };
       try {
-        const client = new A2AClient(deps.orchestrator.base, { token: dispatchToken });
-        await client.taskSend(task);
+        // `taskId` is the idempotency key: a retry reuses the same task object,
+        // so a lost response cannot create a second run.start. Auth/validation
+        // failures are never retried; retries are bounded and jittered.
+        await retry(
+          async (attempt) => {
+            const client = new A2AClient(deps.orchestrator!.base, {
+              token: await tokenForAttempt(attempt),
+              ...(deps.orchestrator!.timeoutMs !== undefined
+                ? { timeoutMs: deps.orchestrator!.timeoutMs }
+                : {}),
+              ...(deps.orchestrator!.breaker !== undefined
+                ? { breaker: deps.orchestrator!.breaker }
+                : {}),
+            });
+            return client.taskSend(task);
+          },
+          {
+            policy: {
+              ...DEFAULT_RETRY_POLICY,
+              ...(deps.orchestrator.retry ?? {}),
+              // Without STS re-minting, replay protection makes a retry unsafe.
+              ...(canMintFreshToken ? {} : { maxAttempts: 1 }),
+            },
+            shouldRetry: (err) => isRetryable(err, { retryTimeouts: true }),
+            onRetry: async (info) => {
+              deps.log.warn(
+                { runId: run.runId, attempt: info.attempt, classification: info.classification },
+                "retrying run.start dispatch",
+              );
+              void deps.audit.emit({
+                type: "resilience.retry",
+                ts: new Date().toISOString(),
+                traceId: task.taskId,
+                runId: run.runId,
+                taskId: task.taskId,
+                data: {
+                  operation: "run.start.dispatch",
+                  attempt: info.attempt,
+                  delay_ms: info.delayMs,
+                  classification: info.classification,
+                },
+              });
+            },
+          },
+        );
         deps.log.info({ runId: run.runId }, "run.start dispatched to orchestrator");
       } catch (err) {
         deps.log.warn({ err, runId: run.runId }, "run.start dispatch failed; run remains CREATED");
+        void deps.audit.emit({
+          type: "run.dispatch_failed",
+          ts: new Date().toISOString(),
+          traceId: task.taskId,
+          runId: run.runId,
+          taskId: task.taskId,
+          data: {
+            code: err instanceof AppError ? err.code : err instanceof Error ? err.name : "unknown",
+            error: err instanceof Error ? err.message.slice(0, 300) : "unknown error",
+          },
+        });
       }
     }
 

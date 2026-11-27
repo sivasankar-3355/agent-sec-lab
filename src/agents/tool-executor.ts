@@ -11,10 +11,11 @@ import type {
 } from "../security/protocols.js";
 import type { ToolExecutionRequest, ToolExecutor } from "../security/tools/index.js";
 import { isDisallowedIp } from "../security/tools/index.js";
+import { BudgetExceededError, type RunGovernor } from "../core/resilience/index.js";
 import type { Repositories } from "../db/repositories/build.js";
 import type { MemoryService } from "./memory.js";
 import type { ToolCatalog } from "./tool-catalog.js";
-import type { ToolOperationContext, ToolRuntime } from "./tool-operation.js";
+import type { OperationBudget, ToolOperationContext, ToolRuntime } from "./tool-operation.js";
 
 export interface LocalToolExecutorDeps {
   audit: AuditProvider;
@@ -24,6 +25,9 @@ export interface LocalToolExecutorDeps {
   repos: Repositories;
   sandbox: SandboxProvider;
   memory?: MemoryService;
+  /** Shared run governor; the broker and operations consume the same budgets. */
+  governor?: RunGovernor;
+  llmTimeoutMs?: number;
 }
 
 /**
@@ -61,6 +65,31 @@ export class LocalToolExecutor implements ToolExecutor, ToolRuntime {
     const runtime: ToolRuntime = {
       runStep: (step) => this.runStep(step, request.target),
     };
+    const governor = this.deps.governor;
+    const budget: OperationBudget = {
+      budget: request.budget,
+      llmTimeoutMs: this.deps.llmTimeoutMs ?? 30_000,
+      remainingMs: () =>
+        governor === undefined
+          ? Number.POSITIVE_INFINITY
+          : governor.remainingMs(request.run, request.budget),
+      consumeLlm: async () => {
+        if (governor === undefined) return false;
+        try {
+          await governor.consumeLlmCall(request.run, request.budget);
+          return true;
+        } catch (err) {
+          if (err instanceof BudgetExceededError) {
+            // A run deadline is global and must not be swallowed. An exhausted
+            // or unavailable LLM-call budget instead degrades safely to the
+            // deterministic path without model reasoning.
+            if (err.code === "run_deadline_exceeded") throw err;
+            return false;
+          }
+          throw err;
+        }
+      },
+    };
     const context: ToolOperationContext = {
       request,
       audit: this.deps.audit,
@@ -70,6 +99,7 @@ export class LocalToolExecutor implements ToolExecutor, ToolRuntime {
       repos: this.deps.repos,
       ...(this.deps.memory !== undefined ? { memory: this.deps.memory } : {}),
       runtime,
+      budget,
     };
     return definition.operation(context);
   }

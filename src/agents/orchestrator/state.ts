@@ -2,7 +2,7 @@ import type { RunState } from "../../core/domain.js";
 import { AppError } from "../../core/errors.js";
 
 const TRANSITIONS: ReadonlyMap<RunState, readonly RunState[]> = new Map<RunState, readonly RunState[]>([
-  ["CREATED", ["STARTED", "FAILED"]],
+  ["CREATED", ["STARTED", "FAILED", "CANCELLED"]],
   ["STARTED", ["RECON", "FAILED", "CANCELLED"]],
   ["RECON", ["KNOWLEDGE", "FAILED", "CANCELLED"]],
   ["KNOWLEDGE", ["REPORT", "FAILED", "CANCELLED"]],

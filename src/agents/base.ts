@@ -1,5 +1,7 @@
 import type { Logger } from "pino";
 import { AppError, NotFoundError } from "../core/errors.js";
+import { withDeadline } from "../core/resilience/abort.js";
+import { CancelledError } from "../core/resilience/errors.js";
 import type { AuditProvider, VerifiedContext } from "../security/protocols.js";
 import type { ToolBroker } from "../security/tools/index.js";
 import { createAgentCard } from "../a2a/agentCard.js";
@@ -44,11 +46,25 @@ export interface WorkerExecutor {
   execute(ctx: WorkerContext, task: WorkerExecuteInput): Promise<Record<string, unknown>>;
 }
 
+export interface WorkerHandlerOptions {
+  /** Hard wall-clock bound for one worker task (cooperative). */
+  taskTimeoutMs?: number;
+  /** Local process admission limit; excess tasks fail fast with a structured error. */
+  maxConcurrentTasks?: number;
+}
+
 interface MemoryTask {
   init: TaskInit;
   status: A2AStatus;
   artifact?: { artifactId: string; text: string };
   error?: string;
+}
+
+/** Structured task failure text: `<code>: <safe message>`. */
+function failureText(err: unknown): string {
+  if (err instanceof AppError) return `${err.code}: ${err.message}`;
+  if (err instanceof Error) return `task_failed: ${err.message}`;
+  return "task_failed: unknown error";
 }
 
 function assertRunBound(
@@ -81,15 +97,26 @@ export class BaseWorkerHandler implements A2AHandler {
   private readonly executor: WorkerExecutor;
   private readonly ctx: WorkerContext;
   private readonly acceptedKinds: readonly TaskKind[];
+  private readonly options: Required<WorkerHandlerOptions>;
   private readonly tasks = new Map<string, MemoryTask>();
   private readonly running = new Map<string, Promise<void>>();
   private readonly aborts = new Map<string, AbortController>();
 
-  constructor(agent: AgentKind, executor: WorkerExecutor, ctx: WorkerContext, acceptedKinds: readonly TaskKind[]) {
+  constructor(
+    agent: AgentKind,
+    executor: WorkerExecutor,
+    ctx: WorkerContext,
+    acceptedKinds: readonly TaskKind[],
+    options: WorkerHandlerOptions = {},
+  ) {
     this.agent = agent;
     this.executor = executor;
     this.ctx = ctx;
     this.acceptedKinds = acceptedKinds;
+    this.options = {
+      taskTimeoutMs: options.taskTimeoutMs ?? 120_000,
+      maxConcurrentTasks: options.maxConcurrentTasks ?? 8,
+    };
   }
 
   async agentCard(): Promise<AgentCard> {
@@ -137,6 +164,26 @@ export class BaseWorkerHandler implements A2AHandler {
     const existing = this.tasks.get(task.taskId);
     if (existing) return { task: this.toA2A(existing) };
 
+    if (this.running.size >= this.options.maxConcurrentTasks) {
+      // Fail fast instead of unbounded queueing: the orchestrator sees a
+      // structured failed task and can isolate/skip this agent.
+      const rejected: MemoryTask = {
+        init: task,
+        status: "failed",
+        error: `worker_capacity_exceeded: at most ${this.options.maxConcurrentTasks} concurrent tasks`,
+      };
+      this.tasks.set(task.taskId, rejected);
+      void this.ctx.audit.emit({
+        type: "task.rejected",
+        ts: new Date().toISOString(),
+        traceId: task.taskId,
+        runId: task.runId,
+        taskId: task.taskId,
+        data: { agent: this.agent, reason: "worker_capacity_exceeded" },
+      });
+      return { task: this.toA2A(rejected) };
+    }
+
     const record: MemoryTask = { init: task, status: "submitted" };
     this.tasks.set(task.taskId, record);
     const controller = new AbortController();
@@ -160,8 +207,7 @@ export class BaseWorkerHandler implements A2AHandler {
       return { task: this.toA2A(record) };
     }
     record.status = "canceled";
-    this.running.delete(id);
-    this.aborts.get(id)?.abort();
+    this.aborts.get(id)?.abort(new CancelledError(`task '${id}' was cancelled`));
     this.aborts.delete(id);
     void this.ctx.audit.emit({
       type: "task.cancelled",
@@ -183,7 +229,9 @@ export class BaseWorkerHandler implements A2AHandler {
     authz?: VerifiedContext,
     controller?: AbortController,
   ): Promise<void> {
-    this.tasks.get(task.taskId)!.status = "working";
+    const initial = this.tasks.get(task.taskId);
+    if (initial === undefined || initial.status === "canceled") return;
+    initial.status = "working";
     void this.ctx.audit.emit({
       type: "task.started",
       ts: new Date().toISOString(),
@@ -193,14 +241,24 @@ export class BaseWorkerHandler implements A2AHandler {
       data: { agent: this.agent, kind: task.kind },
     });
     try {
-      const output = await this.executor.execute(this.ctx, {
-        taskId: task.taskId,
-        runId: task.runId,
-        kind: task.kind,
-        input: task.input,
-        ...(authz !== undefined ? { authz } : {}),
-        ...(controller !== undefined ? { signal: controller.signal } : {}),
-      });
+      // The worker task deadline is a hard caller-visible bound. The executor
+      // receives a combined signal that aborts on timeout or task cancellation.
+      const output = await withDeadline(
+        (signal) =>
+          this.executor.execute(this.ctx, {
+            taskId: task.taskId,
+            runId: task.runId,
+            kind: task.kind,
+            input: task.input,
+            ...(authz !== undefined ? { authz } : {}),
+            signal,
+          }),
+        {
+          timeoutMs: this.options.taskTimeoutMs,
+          ...(controller !== undefined ? { signal: controller.signal } : {}),
+          label: `agent.${this.agent}.task.${task.taskId}`,
+        },
+      );
       const record = this.tasks.get(task.taskId);
       if (!record || record.status === "canceled") return;
       record.status = "completed";
@@ -217,7 +275,7 @@ export class BaseWorkerHandler implements A2AHandler {
       const record = this.tasks.get(task.taskId);
       if (!record || record.status === "canceled") return;
       record.status = "failed";
-      record.error = err instanceof Error ? err.message : "unknown error";
+      record.error = failureText(err);
       this.ctx.log.warn({ err, taskId: task.taskId }, "worker task failed");
       void this.ctx.audit.emit({
         type: "task.failed",

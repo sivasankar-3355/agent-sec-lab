@@ -11,11 +11,17 @@ import type {
   RunTokenMinter,
 } from "../../security/protocols.js";
 import type { MemoryActor, MemoryService } from "../../agents/memory.js";
+import type { CircuitBreaker } from "../../core/resilience/circuit.js";
+import type { RetryPolicy } from "../../core/resilience/retry.js";
 import { readPrincipal } from "../auth.js";
 
 export interface OrchestratorLink {
   base: string;
   token?: string;
+  timeoutMs?: number;
+  retry?: Partial<RetryPolicy>;
+  /** Shared per-orchestrator circuit breaker (gateway-side dispatch). */
+  breaker?: CircuitBreaker;
 }
 
 export interface RouterDeps {

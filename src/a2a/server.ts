@@ -3,6 +3,8 @@ import type { Logger } from "pino";
 import type { z } from "zod";
 import { A2AError, AppError, NotFoundError, UnauthenticatedError } from "../core/errors.js";
 import { newId } from "../core/ids.js";
+import { withDeadline } from "../core/resilience/abort.js";
+import { CancelledError, TimeoutError } from "../core/resilience/errors.js";
 import type {
   AuditProvider,
   AuthTokenProvider,
@@ -32,6 +34,8 @@ export interface AgentServerDeps {
   agent?: AgentKind;
   audience?: string;
   replay?: (nonce: string) => Promise<boolean>;
+  /** Deadline for a single JSON-RPC handler invocation. */
+  requestTimeoutMs?: number;
 }
 
 export interface JsonRpcError {
@@ -49,6 +53,10 @@ const JSONRPC_CODES = {
   unauthenticated: -32001,
   forbidden: -32003,
   notFound: -32004,
+  timeout: -32005,
+  cancelled: -32006,
+  conflict: -32009,
+  budget: -32010,
 } as const;
 
 const PARAM_SCHEMAS: Record<A2AMethod, z.ZodTypeAny | null> = {
@@ -63,6 +71,12 @@ const PARAM_SCHEMAS: Record<A2AMethod, z.ZodTypeAny | null> = {
 const RUN_BOUND_METHODS: readonly A2AMethod[] = ["tasks/send", "tasks/get", "tasks/cancel", "message/send"];
 
 function errorMap(err: unknown): JsonRpcError {
+  if (err instanceof TimeoutError) {
+    return { code: JSONRPC_CODES.timeout, message: err.message };
+  }
+  if (err instanceof CancelledError) {
+    return { code: JSONRPC_CODES.cancelled, message: err.message };
+  }
   if (err instanceof UnauthenticatedError) {
     return { code: JSONRPC_CODES.unauthenticated, message: err.message };
   }
@@ -70,20 +84,29 @@ function errorMap(err: unknown): JsonRpcError {
     return { code: JSONRPC_CODES.notFound, message: err.message };
   }
   if (err instanceof A2AError) {
-    return { code: err.status === 403 ? JSONRPC_CODES.forbidden : JSONRPC_CODES.internal, message: err.message };
+    if (err.status === 403) return { code: JSONRPC_CODES.forbidden, message: err.message };
+    if (err.status === 409) return { code: JSONRPC_CODES.conflict, message: err.message };
+    if (err.status === 429) return { code: JSONRPC_CODES.budget, message: err.message };
+    return { code: JSONRPC_CODES.internal, message: err.message };
   }
   if (err instanceof AppError) {
     if (err.status === 403) return { code: JSONRPC_CODES.forbidden, message: err.message };
+    if (err.status === 409) return { code: JSONRPC_CODES.conflict, message: err.message };
+    if (err.status === 429) return { code: JSONRPC_CODES.budget, message: err.message };
     return { code: JSONRPC_CODES.internal, message: err.message };
   }
   return { code: JSONRPC_CODES.internal, message: "internal error" };
 }
 
 function firstErrorCode(err: unknown): number {
+  if (err instanceof TimeoutError) return JSONRPC_CODES.timeout;
+  if (err instanceof CancelledError) return JSONRPC_CODES.cancelled;
   if (err instanceof AppError) {
     if (err.status === 401) return JSONRPC_CODES.unauthenticated;
     if (err.status === 403) return JSONRPC_CODES.forbidden;
     if (err.status === 404) return JSONRPC_CODES.notFound;
+    if (err.status === 409) return JSONRPC_CODES.conflict;
+    if (err.status === 429) return JSONRPC_CODES.budget;
     return JSONRPC_CODES.internal;
   }
   return JSONRPC_CODES.internal;
@@ -93,6 +116,10 @@ function httpStatusForCode(code: number): number {
   if (code === JSONRPC_CODES.unauthenticated) return 401;
   if (code === JSONRPC_CODES.forbidden) return 403;
   if (code === JSONRPC_CODES.notFound) return 404;
+  if (code === JSONRPC_CODES.conflict) return 409;
+  if (code === JSONRPC_CODES.budget) return 429;
+  if (code === JSONRPC_CODES.timeout) return 504;
+  if (code === JSONRPC_CODES.cancelled) return 408;
   return 200;
 }
 
@@ -289,31 +316,45 @@ export function createA2ARouter(handler: A2AHandler, deps: AgentServerDeps): Rou
       return;
     }
 
+    // A client disconnect aborts the handler's cooperative signal. The
+    // deadline bounds the handler invocation itself so a hung handler cannot
+    // hold the HTTP request open indefinitely.
+    const requestAbort = new AbortController();
+    const onClose = (): void => {
+      if (!res.writableEnded) requestAbort.abort(new CancelledError("a2a client disconnected"));
+    };
+    res.on("close", onClose);
+
     const callCtx: CallContext | undefined =
-      parsedCtx !== undefined ? { verified: parsedCtx, token } : undefined;
+      parsedCtx !== undefined
+        ? { verified: parsedCtx, token, signal: requestAbort.signal }
+        : undefined;
 
     try {
-      let result: unknown;
-      switch (method) {
-        case "initialize":
-          result = await handler.initialize((params as { agentId?: string } | undefined) ?? {}, callCtx);
-          break;
-        case "agentCard":
-          result = await handler.agentCard();
-          break;
-        case "message/send":
-          result = await handler.messageSend((params as { message: A2AMessage }).message, callCtx);
-          break;
-        case "tasks/send":
-          result = await handler.taskSend((params as { task: TaskInit }).task, callCtx);
-          break;
-        case "tasks/get":
-          result = await handler.taskGet((params as { id: string }).id, callCtx);
-          break;
-        case "tasks/cancel":
-          result = await handler.taskCancel((params as { id: string }).id, callCtx);
-          break;
-      }
+      const result: unknown = await withDeadline(
+        async () => {
+          switch (method) {
+            case "initialize":
+              return handler.initialize((params as { agentId?: string } | undefined) ?? {}, callCtx);
+            case "agentCard":
+              return handler.agentCard();
+            case "message/send":
+              return handler.messageSend((params as { message: A2AMessage }).message, callCtx);
+            case "tasks/send":
+              return handler.taskSend((params as { task: TaskInit }).task, callCtx);
+            case "tasks/get":
+              return handler.taskGet((params as { id: string }).id, callCtx);
+            case "tasks/cancel":
+              return handler.taskCancel((params as { id: string }).id, callCtx);
+          }
+          throw new A2AError(`method not implemented: ${method}`);
+        },
+        {
+          timeoutMs: deps.requestTimeoutMs ?? 5_000,
+          signal: requestAbort.signal,
+          label: `a2a.request.${method}`,
+        },
+      );
 
       void deps.audit.emit({
         type: "a2a.request.accepted",
@@ -338,8 +379,12 @@ export function createA2ARouter(handler: A2AHandler, deps: AgentServerDeps): Rou
         ...(resource.taskId !== undefined ? { taskId: resource.taskId } : {}),
         data: { method, code: jrpcError.code, message: jrpcError.message },
       });
-      const status = httpStatusForCode(firstErrorCode(err));
-      res.status(status).json({ jsonrpc: "2.0", id: rpcId, error: jrpcError });
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        const status = httpStatusForCode(firstErrorCode(err));
+        res.status(status).json({ jsonrpc: "2.0", id: rpcId, error: jrpcError });
+      }
+    } finally {
+      res.off("close", onClose);
     }
   });
 

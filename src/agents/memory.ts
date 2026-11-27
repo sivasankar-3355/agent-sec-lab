@@ -39,7 +39,11 @@ import type {
 } from "../security/protocols.js";
 import { inspectUntrustedContent } from "../security/prompt/index.js";
 import type { DetectionResult, UntrustedTier } from "../security/prompt/types.js";
+import { withDeadline } from "../core/resilience/abort.js";
 import { authorizeDocumentAccess } from "./authz.js";
+
+/** Default caller-visible deadline for a memory operation. */
+export const DEFAULT_MEMORY_TIMEOUT_MS = 30_000;
 
 /**
  * Verified caller identity for a memory operation.
@@ -164,6 +168,8 @@ export interface MemoryServiceDeps {
   authz: AuthorizationProvider;
   audit: AuditProvider;
   embedding: EmbeddingProvider;
+  /** Caller-visible deadline for each memory operation (cooperative). */
+  timeoutMs?: number;
 }
 
 /** Upper bound on retrieved chunks; code-owned, never model-selected. */
@@ -316,6 +322,7 @@ export class MemoryService {
   private readonly authz: AuthorizationProvider;
   private readonly audit: AuditProvider;
   private readonly embedding: EmbeddingProvider;
+  private readonly timeoutMs: number;
 
   constructor(deps: MemoryServiceDeps) {
     this.memories = deps.stores.memories;
@@ -325,9 +332,26 @@ export class MemoryService {
     this.authz = deps.authz;
     this.audit = deps.audit;
     this.embedding = deps.embedding;
+    this.timeoutMs = deps.timeoutMs ?? DEFAULT_MEMORY_TIMEOUT_MS;
+  }
+
+  /**
+   * Bound each public operation. The deadline rejects the caller and aborts
+   * the cooperative signal, but storage/driver work that ignores the signal may
+   * finish later; Mongo/Qdrant clients already have their own 3s timeouts.
+   */
+  private async bounded<T>(operation: string, work: () => Promise<T>): Promise<T> {
+    return withDeadline(async () => work(), {
+      timeoutMs: this.timeoutMs,
+      label: `memory.${operation}`,
+    });
   }
 
   async write(actor: MemoryActor, input: WriteMemoryInput): Promise<MemoryRecord> {
+    return this.bounded("write", () => this.writeImpl(actor, input));
+  }
+
+  private async writeImpl(actor: MemoryActor, input: WriteMemoryInput): Promise<MemoryRecord> {
     this.assertActor(actor);
     assertKnownKeys(input, WRITE_MEMORY_KEYS, "memory write");
     if (typeof input.content !== "string" || typeof input.sourceId !== "string") {
@@ -448,6 +472,10 @@ export class MemoryService {
    * already access, but only the authenticated gateway admits new content.
    */
   async ingestDocument(actor: MemoryActor, input: IngestDocumentInput): Promise<IngestDocumentResult> {
+    return this.bounded("ingestDocument", () => this.ingestDocumentImpl(actor, input));
+  }
+
+  private async ingestDocumentImpl(actor: MemoryActor, input: IngestDocumentInput): Promise<IngestDocumentResult> {
     this.assertActor(actor);
     assertKnownKeys(input, INGEST_DOCUMENT_KEYS, "document ingest");
     if (typeof input.content !== "string" || typeof input.source !== "string") {
@@ -563,6 +591,10 @@ export class MemoryService {
    * the existing policy, and returns untrusted data with provenance.
    */
   async searchDocuments(actor: MemoryActor, input: SearchDocumentsInput): Promise<SearchDocumentsResult> {
+    return this.bounded("searchDocuments", () => this.searchDocumentsImpl(actor, input));
+  }
+
+  private async searchDocumentsImpl(actor: MemoryActor, input: SearchDocumentsInput): Promise<SearchDocumentsResult> {
     this.assertActor(actor);
     const requested = input.limit ?? 10;
     const limit = Math.min(Math.max(1, Math.trunc(requested)), MAX_DOCUMENT_RETRIEVAL_LIMIT);
@@ -644,6 +676,10 @@ export class MemoryService {
    * independently authorized; unlike ingestion this does not admit new content.
    */
   async indexDocuments(actor: MemoryActor, docIds: readonly string[]): Promise<{ indexed: readonly string[] }> {
+    return this.bounded("indexDocuments", () => this.indexDocumentsImpl(actor, docIds));
+  }
+
+  private async indexDocumentsImpl(actor: MemoryActor, docIds: readonly string[]): Promise<{ indexed: readonly string[] }> {
     this.assertActor(actor);
     if (actor.kind !== "operation") {
       throw new AuthorizationDeniedError("document indexing is only available to an agent operation");
@@ -706,6 +742,10 @@ export class MemoryService {
   }
 
   async get(actor: MemoryActor, memoryId: string): Promise<MemoryRecord> {
+    return this.bounded("get", () => this.getImpl(actor, memoryId));
+  }
+
+  private async getImpl(actor: MemoryActor, memoryId: string): Promise<MemoryRecord> {
     this.assertActor(actor);
     const record = await this.memories.get(memoryId);
     if (record === null) throw new NotFoundError("memory not found");
@@ -717,6 +757,10 @@ export class MemoryService {
   }
 
   async search(actor: MemoryActor, input: SearchMemoryInput = {}): Promise<MemorySearchResult> {
+    return this.bounded("search", () => this.searchImpl(actor, input));
+  }
+
+  private async searchImpl(actor: MemoryActor, input: SearchMemoryInput = {}): Promise<MemorySearchResult> {
     this.assertActor(actor);
     assertKnownKeys(input, SEARCH_MEMORY_KEYS, "memory search");
     const requested = input.limit ?? MEMORY_LIMITS.defaultResults;
@@ -820,6 +864,10 @@ export class MemoryService {
   }
 
   async update(actor: MemoryActor, memoryId: string, input: UpdateMemoryInput): Promise<MemoryRecord> {
+    return this.bounded("update", () => this.updateImpl(actor, memoryId, input));
+  }
+
+  private async updateImpl(actor: MemoryActor, memoryId: string, input: UpdateMemoryInput): Promise<MemoryRecord> {
     this.assertActor(actor);
     assertKnownKeys(input, UPDATE_MEMORY_KEYS, "memory update");
     const record = await this.memories.get(memoryId);
@@ -890,6 +938,10 @@ export class MemoryService {
   }
 
   async remove(actor: MemoryActor, memoryId: string): Promise<boolean> {
+    return this.bounded("remove", () => this.removeImpl(actor, memoryId));
+  }
+
+  private async removeImpl(actor: MemoryActor, memoryId: string): Promise<boolean> {
     this.assertActor(actor);
     const record = await this.memories.get(memoryId);
     if (record === null) throw new NotFoundError("memory not found");

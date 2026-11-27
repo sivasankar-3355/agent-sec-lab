@@ -10,6 +10,7 @@ import {
   assemblePrompt,
   auditPromptAssembly,
 } from "../../security/prompt/index.js";
+import { withDeadline } from "../../core/resilience/abort.js";
 
 export const reconAcceptedKinds: readonly ["recon.run"] = ["recon.run"];
 
@@ -89,13 +90,29 @@ export const reconSnapshotOperation: ToolOperation = async (ctx) => {
   });
 
   let note = "";
-  try {
-    const completion = await ctx.model.complete(assembly.prompt, assembly.context);
-    // Model output is also untrusted: normalize it before persistence so it
-    // cannot smuggle prompt-boundary or chat-template tokens into reports.
-    note = asDataText(completion.text, 2000);
-  } catch {
-    // model control not wired; reasoning is optional
+  // LLM reasoning is optional and budgeted. Exhausting the LLM budget (or an
+  // unavailable/misconfigured model) degrades to the deterministic sandbox
+  // observation instead of failing the recon task.
+  if (await ctx.budget.consumeLlm()) {
+    try {
+      const completion = await withDeadline(
+        (signal) =>
+          ctx.model.complete(assembly.prompt, assembly.context, {
+            signal,
+            timeoutMs: ctx.budget.llmTimeoutMs,
+          }),
+        {
+          timeoutMs: Math.min(ctx.budget.llmTimeoutMs, Math.max(1, ctx.budget.remainingMs())),
+          signal: ctx.request.signal,
+          label: "recon.llm",
+        },
+      );
+      // Model output is also untrusted: normalize it before persistence so it
+      // cannot smuggle prompt-boundary or chat-template tokens into reports.
+      note = asDataText(completion.text, 2000);
+    } catch {
+      // model control not wired/timed out/cancelled; reasoning is optional
+    }
   }
 
   if (ctx.request.signal.aborted) {

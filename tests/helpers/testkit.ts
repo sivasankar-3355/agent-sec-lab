@@ -40,6 +40,7 @@ import {
   type ToolSpec,
 } from "../../src/security/tools/index.js";
 import type { Coordinator } from "../../src/db/coordinator.js";
+import { RunGovernor } from "../../src/core/resilience/index.js";
 import type { ChildTaskBroker } from "../../src/agents/orchestrator/broker.js";
 import type { A2ATask, A2AStatus, TaskInit } from "../../src/a2a/schema.js";
 import { newId } from "../../src/core/ids.js";
@@ -718,6 +719,10 @@ export class FakeCoordinator implements Coordinator {
     return true;
   }
 
+  async extendLock(key: string): Promise<boolean> {
+    return this.holdings.has(key);
+  }
+
   async releaseLock(key: string): Promise<void> {
     this.holdings.delete(key);
   }
@@ -847,6 +852,7 @@ export function makeMemoryService(
   security: FailClosedSecurityProviders,
   runs: RunsRepository,
   stores: MemoryStores = new FakeMemoryStores(),
+  timeoutMs?: number,
 ): MemoryService {
   return createMemoryService({
     stores,
@@ -854,6 +860,7 @@ export function makeMemoryService(
     authz: security.authz,
     audit: security.audit,
     embedding: security.embedding,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
   });
 }
 
@@ -861,9 +868,16 @@ export function makeMemoryService(
 export function makeToolBroker(
   security: FailClosedSecurityProviders,
   repos: FakeRepositories,
-  options: { memory?: MemoryService; resolver?: TargetResolver; catalog?: ToolCatalog } = {},
+  options: {
+    memory?: MemoryService;
+    resolver?: TargetResolver;
+    catalog?: ToolCatalog;
+    governor?: RunGovernor;
+    llmTimeoutMs?: number;
+  } = {},
 ): ToolBroker {
   const catalog = options.catalog ?? agentToolCatalog;
+  const governor = options.governor ?? new RunGovernor();
   const executor = new LocalToolExecutor(catalog, {
     audit: security.audit,
     policy: security.policy,
@@ -872,6 +886,8 @@ export function makeToolBroker(
     repos,
     sandbox: security.sandbox,
     ...(options.memory !== undefined ? { memory: options.memory } : {}),
+    governor,
+    ...(options.llmTimeoutMs !== undefined ? { llmTimeoutMs: options.llmTimeoutMs } : {}),
   });
   return createToolBroker({
     registry: catalog.registry,
@@ -881,6 +897,7 @@ export function makeToolBroker(
     network: security.network,
     resolver: options.resolver ?? new TestTargetResolver(),
     resolveRun: (runId) => repos.runs.get(runId),
+    governor,
   });
 }
 
